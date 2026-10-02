@@ -299,6 +299,161 @@ func (s *Service) GetTrialBalance(asOf string) (any, error) {
 	})
 }
 
+// GetFinancialStatements derives a read-only balance sheet at asOf and an
+// income statement over the closed period [periodStart, periodEnd]. It is
+// recomputed from the stored functional amounts on the immutable journals on
+// every call, never writes state, creates no vouchers and changes no close.
+func (s *Service) GetFinancialStatements(asOf, periodStart, periodEnd string) (any, error) {
+	if asOf == "" {
+		return nil, ValidationError("as_of query parameter is required")
+	}
+	asOfDate, err := validateDate(asOf, "as_of")
+	if err != nil {
+		return nil, err
+	}
+	if periodStart == "" {
+		return nil, ValidationError("period_start query parameter is required")
+	}
+	startDate, err := validateDate(periodStart, "period_start")
+	if err != nil {
+		return nil, err
+	}
+	if periodEnd == "" {
+		return nil, ValidationError("period_end query parameter is required")
+	}
+	endDate, err := validateDate(periodEnd, "period_end")
+	if err != nil {
+		return nil, err
+	}
+	if startDate > endDate {
+		return nil, ValidationError("period_start must not be after period_end")
+	}
+	if endDate > asOfDate {
+		return nil, ValidationError("period_end must not be after as_of")
+	}
+	return s.store.View(func(state *State) (any, error) {
+		accounts := sortedAccounts(state)
+
+		// Functional debit and credit totals per account for the balance
+		// sheet window (through asOf) and the income window (the period).
+		asOfDebit := make(map[string]int64, len(accounts))
+		asOfCredit := make(map[string]int64, len(accounts))
+		periodDebit := make(map[string]int64, len(accounts))
+		periodCredit := make(map[string]int64, len(accounts))
+		for _, account := range accounts {
+			asOfDebit[account.ID] = 0
+			asOfCredit[account.ID] = 0
+			periodDebit[account.ID] = 0
+			periodCredit[account.ID] = 0
+		}
+		for _, journal := range sortedJournals(state) {
+			if journal.Date > asOfDate {
+				continue
+			}
+			inPeriod := journal.Date >= startDate && journal.Date <= endDate
+			for _, line := range journal.Lines {
+				if _, known := asOfDebit[line.AccountID]; !known {
+					return nil, InternalError("journal %s posts to unknown account %s", journal.ID, line.AccountID)
+				}
+				if line.Side == "debit" {
+					asOfDebit[line.AccountID] += line.FunctionalAmountMinor
+					if inPeriod {
+						periodDebit[line.AccountID] += line.FunctionalAmountMinor
+					}
+				} else {
+					asOfCredit[line.AccountID] += line.FunctionalAmountMinor
+					if inPeriod {
+						periodCredit[line.AccountID] += line.FunctionalAmountMinor
+					}
+				}
+			}
+		}
+
+		balanceSheet := &BalanceSheet{
+			Assets:      []*FinancialStatementAccount{},
+			Liabilities: []*FinancialStatementAccount{},
+			Equity:      []*FinancialStatementAccount{},
+		}
+		incomeStatement := &IncomeStatement{
+			Revenue:  []*FinancialStatementAccount{},
+			Expenses: []*FinancialStatementAccount{},
+		}
+		for _, account := range accounts {
+			row := &FinancialStatementAccount{
+				AccountID:   account.ID,
+				AccountName: account.Name,
+				ParentID:    account.ParentID,
+				Currency:    account.Currency,
+			}
+			debitNormal := account.NormalBalance == "debit"
+			balance := asOfDebit[account.ID] - asOfCredit[account.ID]
+			if !debitNormal {
+				balance = -balance
+			}
+			row.FunctionalBalanceMinor = balance
+			switch account.Type {
+			case "asset":
+				balanceSheet.Assets = append(balanceSheet.Assets, row)
+				balanceSheet.AssetsTotalMinor += balance
+			case "liability":
+				balanceSheet.Liabilities = append(balanceSheet.Liabilities, row)
+				balanceSheet.LiabilitiesTotalMinor += balance
+			case "equity":
+				balanceSheet.Equity = append(balanceSheet.Equity, row)
+				balanceSheet.EquityTotalMinor += balance
+			case "revenue":
+				incomeStatement.Revenue = append(incomeStatement.Revenue, periodRow(account, periodCredit, periodDebit))
+				incomeStatement.RevenueTotalMinor += periodCredit[account.ID] - periodDebit[account.ID]
+			case "expense":
+				incomeStatement.Expenses = append(incomeStatement.Expenses, periodRow(account, periodDebit, periodCredit))
+				incomeStatement.ExpensesTotalMinor += periodDebit[account.ID] - periodCredit[account.ID]
+			}
+		}
+		incomeStatement.NetIncomeMinor = incomeStatement.RevenueTotalMinor - incomeStatement.ExpensesTotalMinor
+
+		// Equity through as_of includes the income earned through as_of, so
+		// the accounting equation balances even before the books are closed.
+		var revenueThroughAsOf, expensesThroughAsOf int64
+		for _, account := range accounts {
+			switch account.Type {
+			case "revenue":
+				revenueThroughAsOf += asOfCredit[account.ID] - asOfDebit[account.ID]
+			case "expense":
+				expensesThroughAsOf += asOfDebit[account.ID] - asOfCredit[account.ID]
+			}
+		}
+		balanceSheet.EquityTotalMinor += revenueThroughAsOf - expensesThroughAsOf
+		balanceSheet.BalanceCheckMinor = balanceSheet.AssetsTotalMinor -
+			balanceSheet.LiabilitiesTotalMinor - balanceSheet.EquityTotalMinor
+		balanceSheet.Status = "balanced"
+		if balanceSheet.BalanceCheckMinor != 0 {
+			balanceSheet.Status = "unbalanced"
+		}
+		return &FinancialStatements{
+			AsOf:               asOfDate,
+			PeriodStart:        startDate,
+			PeriodEnd:          endDate,
+			FunctionalCurrency: s.functionalCurrency,
+			BalanceSheet:       balanceSheet,
+			IncomeStatement:    incomeStatement,
+		}, nil
+	})
+}
+
+// periodRow builds the income-statement row for one account from the functional
+// totals of journals dated inside the report period; positive holds the side
+// that increases the account type (debits for expenses, credits for revenue)
+// and negative the opposite side.
+func periodRow(account *Account, positive, negative map[string]int64) *FinancialStatementAccount {
+	return &FinancialStatementAccount{
+		AccountID:              account.ID,
+		AccountName:            account.Name,
+		ParentID:               account.ParentID,
+		Currency:               account.Currency,
+		FunctionalBalanceMinor: positive[account.ID] - negative[account.ID],
+	}
+}
+
 type createRateRequest struct {
 	Base  string `json:"base"`
 	Quote string `json:"quote"`

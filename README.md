@@ -14,6 +14,9 @@ The initial release intentionally supports a compact public contract:
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
 - `GET /reports/trial-balance` is a read-only as-of report that sums the stored
   functional amounts of every account and never writes state;
+- `GET /reports/financial-statements` is a read-only month-end report that
+  builds a balance sheet at `as_of` and an income statement over a closed
+  period, reuses the stored functional amounts and never writes state;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
 - duplicate commands with the same idempotency key return the original result.
 
@@ -104,6 +107,24 @@ footer reports `as_of`, `functional_currency`, `functional_debit_total_minor`
 row), the sum of every row's `posting_count`, and `status`: `balanced` when the
 two functional totals are equal, otherwise `unbalanced`. An empty ledger
 returns an empty `accounts` array and all-zero totals.
+
+**Financial statements.** `GET /reports/financial-statements` is read-only and
+recomputed on every call; it never writes state. `as_of` cuts the balance sheet
+(journals with `date <= as_of`) while `period_start` and `period_end` bound the
+income statement inclusively, and `period_start <= period_end <= as_of` must
+hold. Every amount is functional-currency minor units taken from the stored
+`functional_amount_minor`, so no exchange rate is ever recomputed. The balance
+sheet lists `assets`, `liabilities` and `equity`, and the income statement lists
+`revenue` and `expenses`; within each section accounts are ordered by id, every
+account gets one row even at zero, and children stay on their own row. Assets
+and expenses orient debits minus credits; the other sections orient credits
+minus debits. Each row carries `account_id`, `account_name`, `parent_id`,
+`currency` and `functional_balance_minor`. `equity_total_minor` is equity
+credit-minus-debit through `as_of` plus revenue minus expenses through `as_of`;
+`balance_check_minor` is assets minus liabilities minus equity and drives
+`balance_sheet.status` (`balanced` at zero, otherwise `unbalanced`).
+`net_income_minor` is period revenue minus period expenses; an empty ledger
+returns empty arrays, zero totals and `balanced`.
 
 **Statements.** `POST /statements` imports one statement for one account.
 `period` is `{start, end}` and every line date must fall inside it.
@@ -229,6 +250,59 @@ parameter, returns HTTP 400 with `validation_error`.
  "functional_credit_total_minor":724500,
  "posting_count":2,"status":"balanced"}
 ```
+
+### Read the month-end financial statements
+
+```http
+GET /reports/financial-statements?as_of=2024-01-31&period_start=2024-01-01&period_end=2024-01-31
+```
+
+A read-only report that returns a `balance_sheet` dated at `as_of` and an
+`income_statement` over the inclusive period `period_start`..`period_end`. The
+three date parameters must each appear exactly once, be `YYYY-MM-DD` dates and
+satisfy `period_start <= period_end <= as_of`; a missing, malformed, repeated
+or out-of-order date, or any unknown query parameter, returns HTTP 400 with
+`validation_error`, reporting the first problem in `as_of`, `period_start`,
+`period_end` order. The report writes no snapshot, creates no voucher and
+changes no close.
+
+Every amount is expressed in the functional currency's minor unit and comes
+from the `functional_amount_minor` already stored on each journal line — rates
+are never recomputed. Each section lists the accounts of its type ordered by
+account id, one row per account even with no postings (`functional_balance_minor`
+is then zero), and child accounts are never rolled into their parent. Each row
+carries `account_id`, `account_name`, `parent_id`, `currency` and
+`functional_balance_minor`. Assets and expenses take debits minus credits;
+liabilities, equity and revenue take credits minus debits. The balance sheet
+only reads journals dated on or before `as_of`; the income statement only reads
+journals dated inside the period.
+
+```json
+{"as_of":"2024-01-31","period_start":"2024-01-01","period_end":"2024-01-31",
+ "functional_currency":"CNY",
+ "balance_sheet":{
+   "assets":[{"account_id":"1100","account_name":"Cash","parent_id":"1000",
+     "currency":"CNY","functional_balance_minor":1220700}],
+   "liabilities":[],"equity":[{"account_id":"3000","account_name":"Equity",
+     "parent_id":null,"currency":"CNY","functional_balance_minor":1000000}],
+   "assets_total_minor":1220700,"liabilities_total_minor":0,
+   "equity_total_minor":1220700,"balance_check_minor":0,"status":"balanced"},
+ "income_statement":{
+   "revenue":[{"account_id":"4000","account_name":"Revenue","parent_id":null,
+     "currency":"CNY","functional_balance_minor":300000}],
+   "expenses":[{"account_id":"5000","account_name":"Rent","parent_id":null,
+     "currency":"CNY","functional_balance_minor":80000}],
+   "revenue_total_minor":300000,"expenses_total_minor":80000,
+   "net_income_minor":220000}}
+```
+
+`equity_total_minor` is the equity accounts' credit-minus-debit total through
+`as_of` plus revenue minus expenses through `as_of`, so the accounting equation
+holds even before earnings are closed into equity. `balance_check_minor` is
+`assets_total_minor - liabilities_total_minor - equity_total_minor`; the balance
+sheet `status` is `balanced` when it is zero and `unbalanced` otherwise.
+`net_income_minor` uses only revenue minus expenses inside the stated period.
+An empty ledger returns empty account arrays, zero totals and `balanced`.
 
 ### Store an exchange rate snapshot
 

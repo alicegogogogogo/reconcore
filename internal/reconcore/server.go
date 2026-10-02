@@ -77,6 +77,16 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.GetTrialBalance(request.URL.Query().Get("as_of"))
 		return http.StatusOK, response, err
 
+	case method == http.MethodGet && len(parts) == 2 && parts[0] == "reports" && parts[1] == "financial-statements":
+		query := request.URL.Query()
+		if err := requireNamedQueries(request, "as_of", "period_start", "period_end"); err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.GetFinancialStatements(
+			query.Get("as_of"), query.Get("period_start"), query.Get("period_end"),
+		)
+		return http.StatusOK, response, err
+
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "journals":
 		body, err := readJSONBody(request)
 		if err != nil {
@@ -220,6 +230,34 @@ func requireSingleQuery(request *http.Request, name string) error {
 	}
 	for candidate := range query {
 		if candidate != name {
+			return ValidationError("unknown query parameter %s", candidate)
+		}
+	}
+	return nil
+}
+
+// requireNamedQueries rejects unknown query parameters and repeated values for
+// every documented name, checking the names in the order the route documents
+// so the first failure is reported in that order.
+func requireNamedQueries(request *http.Request, names ...string) error {
+	query := request.URL.Query()
+	for _, name := range names {
+		if len(query[name]) == 0 {
+			return ValidationError("%s query parameter is required", name)
+		}
+		if len(query[name]) > 1 {
+			return ValidationError("query parameter %s must appear exactly once", name)
+		}
+	}
+	for candidate := range query {
+		known := false
+		for _, name := range names {
+			if candidate == name {
+				known = true
+				break
+			}
+		}
+		if !known {
 			return ValidationError("unknown query parameter %s", candidate)
 		}
 	}

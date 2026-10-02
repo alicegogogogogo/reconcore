@@ -234,6 +234,54 @@ type TrialBalance struct {
 	Status                     string             `json:"status"`
 }
 
+// FinancialStatementAccount is one account row on a financial statement. The
+// balance is the stored functional-currency total oriented by the account type
+// (assets and expenses are debit minus credit, the rest credit minus debit);
+// child accounts never roll up into their parent.
+type FinancialStatementAccount struct {
+	AccountID              string  `json:"account_id"`
+	AccountName            string  `json:"account_name"`
+	ParentID               *string `json:"parent_id"`
+	Currency               string  `json:"currency"`
+	FunctionalBalanceMinor int64   `json:"functional_balance_minor"`
+}
+
+// BalanceSheet is the as-of section of the financial statements. Equity total
+// includes the income earned through as_of so the balance check reproduces the
+// accounting equation assets = liabilities + equity.
+type BalanceSheet struct {
+	Assets                []*FinancialStatementAccount `json:"assets"`
+	Liabilities           []*FinancialStatementAccount `json:"liabilities"`
+	Equity                []*FinancialStatementAccount `json:"equity"`
+	AssetsTotalMinor      int64                        `json:"assets_total_minor"`
+	LiabilitiesTotalMinor int64                        `json:"liabilities_total_minor"`
+	EquityTotalMinor      int64                        `json:"equity_total_minor"`
+	BalanceCheckMinor     int64                        `json:"balance_check_minor"`
+	Status                string                       `json:"status"`
+}
+
+// IncomeStatement is the closed-period section of the financial statements.
+// Net income uses only the journals dated inside period_start..period_end.
+type IncomeStatement struct {
+	Revenue            []*FinancialStatementAccount `json:"revenue"`
+	Expenses           []*FinancialStatementAccount `json:"expenses"`
+	RevenueTotalMinor  int64                        `json:"revenue_total_minor"`
+	ExpensesTotalMinor int64                        `json:"expenses_total_minor"`
+	NetIncomeMinor     int64                        `json:"net_income_minor"`
+}
+
+// FinancialStatements is the read-only month-end report. It derives a balance
+// sheet at as_of and an income statement for the closed period, recomputed from
+// the stored journals on every call and never writing state.
+type FinancialStatements struct {
+	AsOf               string           `json:"as_of"`
+	PeriodStart        string           `json:"period_start"`
+	PeriodEnd          string           `json:"period_end"`
+	FunctionalCurrency string           `json:"functional_currency"`
+	BalanceSheet       *BalanceSheet    `json:"balance_sheet"`
+	IncomeStatement    *IncomeStatement `json:"income_statement"`
+}
+
 // decodeObject decodes exactly one JSON object and rejects unknown fields,
 // trailing content and non-object bodies.
 func decodeObject(body []byte, target any) error {

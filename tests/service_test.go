@@ -1134,6 +1134,267 @@ func TestTrialBalanceValidationAndRouting(t *testing.T) {
 	client.expect(request{method: http.MethodPost, path: "/reports/trial-balance"}, 404, "not_found", "")
 }
 
+func TestFinancialStatementsOnEmptyLedger(t *testing.T) {
+	client := newClient(t)
+
+	report := client.ok("/reports/financial-statements?as_of=2024-01-31&period_start=2024-01-01&period_end=2024-01-31")
+	if text(t, report, "as_of") != "2024-01-31" ||
+		text(t, report, "period_start") != "2024-01-01" ||
+		text(t, report, "period_end") != "2024-01-31" ||
+		text(t, report, "functional_currency") != "CNY" {
+		t.Fatalf("report header is %v", report)
+	}
+	sheet := report["balance_sheet"].(map[string]any)
+	income := report["income_statement"].(map[string]any)
+	for _, column := range []string{"assets", "liabilities", "equity"} {
+		if len(objects(t, sheet, column)) != 0 {
+			t.Fatalf("empty balance sheet has %s rows: %v", column, sheet[column])
+		}
+	}
+	for _, column := range []string{"revenue", "expenses"} {
+		if len(objects(t, income, column)) != 0 {
+			t.Fatalf("empty income statement has %s rows: %v", column, income[column])
+		}
+	}
+	for _, name := range []string{
+		"assets_total_minor", "liabilities_total_minor", "equity_total_minor",
+		"balance_check_minor",
+	} {
+		if integer(t, sheet, name) != 0 {
+			t.Fatalf("%s is %v, want zero", name, sheet[name])
+		}
+	}
+	if text(t, sheet, "status") != "balanced" {
+		t.Fatalf("empty balance sheet status is %v", sheet["status"])
+	}
+	for _, name := range []string{"revenue_total_minor", "expenses_total_minor", "net_income_minor"} {
+		if integer(t, income, name) != 0 {
+			t.Fatalf("%s is %v, want zero", name, income[name])
+		}
+	}
+}
+
+func TestFinancialStatementsRowsAndTotals(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1000", "Assets top", "asset", "CNY"))
+	client.created("/accounts", `{"id":"1100","name":"Cash","type":"asset","parent_id":"1000","currency":"CNY"}`)
+	client.created("/accounts", accountBody("1200", "USD cash", "asset", "USD"))
+	client.created("/accounts", accountBody("2000", "Loan", "liability", "CNY"))
+	client.created("/accounts", accountBody("3000", "Equity", "equity", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/accounts", accountBody("4200", "USD revenue", "revenue", "USD"))
+	client.created("/accounts", accountBody("5000", "Rent", "expense", "CNY"))
+	client.created("/accounts", accountBody("5100", "Unused", "expense", "CNY"))
+	client.created("/rates", `{"base":"USD","quote":"CNY","date":"2024-01-01","rate":"7.0"}`)
+
+	// Opening balance: cash against equity.
+	client.created("/journals", `{
+		"id":"jv-open","date":"2024-01-01",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":1000000},
+			{"account_id":"3000","side":"credit","amount_minor":1000000}
+		]}`)
+	// January activity inside the income period.
+	client.created("/journals", `{
+		"id":"jv-sale","date":"2024-01-15",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":300000},
+			{"account_id":"4000","side":"credit","amount_minor":300000}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-usd","date":"2024-01-20",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":100},
+			{"account_id":"4200","side":"credit","amount_minor":100}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-rent","date":"2024-01-31",
+		"lines":[
+			{"account_id":"5000","side":"debit","amount_minor":80000},
+			{"account_id":"1100","side":"credit","amount_minor":80000}
+		]}`)
+	// February activity counts on the balance sheet but not in January income.
+	client.created("/journals", `{
+		"id":"jv-feb","date":"2024-02-10",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":50000},
+			{"account_id":"4000","side":"credit","amount_minor":50000}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-loan","date":"2024-02-15",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":200000},
+			{"account_id":"2000","side":"credit","amount_minor":200000}
+		]}`)
+
+	report := client.ok("/reports/financial-statements?as_of=2024-02-29&period_start=2024-01-01&period_end=2024-01-31")
+	sheet := report["balance_sheet"].(map[string]any)
+	income := report["income_statement"].(map[string]any)
+
+	wantOrder := func(column string, container map[string]any, ids []string) {
+		t.Helper()
+		rows := objects(t, container, column)
+		if len(rows) != len(ids) {
+			t.Fatalf("%s rows are %v, want %v", column, rows, ids)
+		}
+		for index, id := range ids {
+			if text(t, rows[index], "account_id") != id {
+				t.Fatalf("%s is not id-sorted: %v", column, rows)
+			}
+		}
+	}
+	wantOrder("assets", sheet, []string{"1000", "1100", "1200"})
+	wantOrder("liabilities", sheet, []string{"2000"})
+	wantOrder("equity", sheet, []string{"3000"})
+	wantOrder("revenue", income, []string{"4000", "4200"})
+	wantOrder("expenses", income, []string{"5000", "5100"})
+
+	rows := map[string]map[string]any{}
+	for _, column := range []string{"assets", "liabilities", "equity"} {
+		for _, row := range objects(t, sheet, column) {
+			rows[text(t, row, "account_id")] = row
+		}
+	}
+	for _, column := range []string{"revenue", "expenses"} {
+		for _, row := range objects(t, income, column) {
+			rows[text(t, row, "account_id")] = row
+		}
+	}
+	check := func(id string, wantBalance int64) {
+		t.Helper()
+		row := rows[id]
+		if integer(t, row, "functional_balance_minor") != wantBalance {
+			t.Fatalf("%s functional_balance_minor is %v, want %d", id, row["functional_balance_minor"], wantBalance)
+		}
+		if text(t, row, "account_name") == "" || text(t, row, "currency") == "" {
+			t.Fatalf("%s is missing name or currency: %v", id, row)
+		}
+	}
+	// The parent account keeps its own zero balance; children do not roll up.
+	check("1000", 0)
+	if rows["1000"]["parent_id"] != nil || rows["1100"]["parent_id"] != "1000" {
+		t.Fatalf("parent_id values are %v and %v", rows["1000"]["parent_id"], rows["1100"]["parent_id"])
+	}
+	// 1000000 + 300000 - 80000 + 50000 + 200000.
+	check("1100", 1470000)
+	// 100 USD at 7.0 uses the stored functional amount, never a fresh conversion.
+	check("1200", 700)
+	if text(t, rows["1200"], "currency") != "USD" {
+		t.Fatalf("USD row currency is %v", rows["1200"]["currency"])
+	}
+	check("2000", 200000)
+	check("3000", 1000000)
+	// Income rows only see January journals.
+	check("4000", 300000)
+	check("4200", 700)
+	check("5000", 80000)
+	check("5100", 0)
+
+	if integer(t, sheet, "assets_total_minor") != 1470700 {
+		t.Fatalf("assets_total_minor is %v", sheet["assets_total_minor"])
+	}
+	if integer(t, sheet, "liabilities_total_minor") != 200000 {
+		t.Fatalf("liabilities_total_minor is %v", sheet["liabilities_total_minor"])
+	}
+	// Equity accounts 1000000 plus income through as_of (350700 revenue minus
+	// 80000 expenses).
+	if integer(t, sheet, "equity_total_minor") != 1270700 {
+		t.Fatalf("equity_total_minor is %v", sheet["equity_total_minor"])
+	}
+	if integer(t, sheet, "balance_check_minor") != 0 || text(t, sheet, "status") != "balanced" {
+		t.Fatalf("sheet footer is %v %v", sheet["balance_check_minor"], sheet["status"])
+	}
+	if integer(t, income, "revenue_total_minor") != 300700 ||
+		integer(t, income, "expenses_total_minor") != 80000 ||
+		integer(t, income, "net_income_minor") != 220700 {
+		t.Fatalf("income footer is %v", income)
+	}
+
+	// The report is read-only: re-querying returns the same answer and no
+	// voucher, snapshot or close was created.
+	again := client.ok("/reports/financial-statements?as_of=2024-01-31&period_start=2024-01-01&period_end=2024-01-31")
+	againSheet := again["balance_sheet"].(map[string]any)
+	if integer(t, againSheet, "assets_total_minor") != 1220700 ||
+		integer(t, againSheet, "balance_check_minor") != 0 {
+		t.Fatalf("January as-of answer is %v", againSheet)
+	}
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-report"}, 404, "not_found", "")
+}
+
+func TestFinancialStatementsValidationAndRouting(t *testing.T) {
+	client := newClient(t)
+	base := "/reports/financial-statements"
+
+	client.expect(request{method: http.MethodGet, path: base},
+		400, "validation_error", "as_of query parameter is required")
+	client.expect(request{method: http.MethodGet, path: base + "?period_start=2024-01-01&period_end=2024-01-31"},
+		400, "validation_error", "as_of query parameter is required")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=bad&period_start=2024-01-01&period_end=2024-01-31"},
+		400, "validation_error", "ISO 8601")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31"},
+		400, "validation_error", "period_start query parameter is required")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&period_start=bad&period_end=2024-01-31"},
+		400, "validation_error", "ISO 8601")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&period_start=2024-01-01"},
+		400, "validation_error", "period_end query parameter is required")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&period_start=2024-01-01&period_end=bad"},
+		400, "validation_error", "ISO 8601")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&period_start=2024-02-01&period_end=2024-01-31"},
+		400, "validation_error", "period_start must not be after period_end")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-15&period_start=2024-01-01&period_end=2024-01-31"},
+		400, "validation_error", "period_end must not be after as_of")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&as_of=2024-02-01&period_start=2024-01-01&period_end=2024-01-31"},
+		400, "validation_error", "must appear exactly once")
+	client.expect(request{method: http.MethodGet, path: base + "?as_of=2024-01-31&period_start=2024-01-01&period_end=2024-01-31&unknown=1"},
+		400, "validation_error", "unknown query parameter")
+	client.expect(request{method: http.MethodPost, path: base}, 404, "not_found", "")
+}
+
+// TestFinancialStatementsUnbalancedFromCorruptStore seeds a database document
+// with an imbalanced journal, which the validating write API can never produce,
+// to prove the balance sheet derives its status from balance_check_minor.
+func TestFinancialStatementsUnbalancedFromCorruptStore(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	document := `{
+		"accounts": {
+			"1000": {"id":"1000","name":"Cash","type":"asset","parent_id":null,"currency":"CNY","normal_balance":"debit","created_at":"2024-06-01T12:00:00Z"},
+			"4000": {"id":"4000","name":"Revenue","type":"revenue","parent_id":null,"currency":"CNY","normal_balance":"credit","created_at":"2024-06-01T12:00:00Z"}
+		},
+		"journals": {
+			"jv-bad": {
+				"id":"jv-bad","date":"2024-01-15","functional_currency":"CNY",
+				"debit_functional_minor":100,"credit_functional_minor":100,
+				"created_at":"2024-06-01T12:00:00Z",
+				"lines":[
+					{"index":1,"account_id":"1000","side":"debit","amount_minor":100,"currency":"CNY","rate":"","rate_numerator":1,"rate_denominator":1,"rate_source":"identity","functional_amount_minor":100},
+					{"index":2,"account_id":"4000","side":"credit","amount_minor":60,"currency":"CNY","rate":"","rate_numerator":1,"rate_denominator":1,"rate_source":"identity","functional_amount_minor":60}
+				]
+			}
+		},
+		"rates": [], "statements": {}, "reconciliations": {}, "period_closes": {}, "idempotency": {}
+	}`
+	if err := os.WriteFile(database, []byte(document), 0o600); err != nil {
+		t.Fatalf("seed database: %v", err)
+	}
+	client := newClientOn(t, database)
+
+	report := client.ok("/reports/financial-statements?as_of=2024-12-31&period_start=2024-01-01&period_end=2024-12-31")
+	sheet := report["balance_sheet"].(map[string]any)
+	if integer(t, sheet, "assets_total_minor") != 100 {
+		t.Fatalf("assets total is %v", sheet["assets_total_minor"])
+	}
+	// Equity is the 60 revenue credited through as_of.
+	if integer(t, sheet, "equity_total_minor") != 60 {
+		t.Fatalf("equity total is %v", sheet["equity_total_minor"])
+	}
+	if integer(t, sheet, "balance_check_minor") != 40 {
+		t.Fatalf("balance check is %v", sheet["balance_check_minor"])
+	}
+	if text(t, sheet, "status") != "unbalanced" {
+		t.Fatalf("status is %v, want unbalanced", sheet["status"])
+	}
+}
+
 // TestTrialBalanceUnbalancedFromCorruptStore seeds a database document with an
 // imbalanced journal, which the validating write API can never produce, to
 // prove the report derives status from its own totals.
