@@ -107,6 +107,62 @@ type Period struct {
 	End   string `json:"end"`
 }
 
+// PeriodClose is the immutable record that one calendar month is closed.
+// Ordinary journals may no longer be posted into the month; adjustment journals
+// can only enter through the close record.
+type PeriodClose struct {
+	ID                   string   `json:"id"`
+	Period               Period   `json:"period"`
+	Status               string   `json:"status"`
+	ClosedAt             string   `json:"closed_at"`
+	AdjustmentCount      int      `json:"adjustment_count"`
+	AdjustmentJournalIDs []string `json:"adjustment_journal_ids"`
+}
+
+// validateExactDate parses an ISO 8601 calendar date and reports the given
+// message verbatim instead of a field-specific message.
+func validateExactDate(value, message string) (string, error) {
+	parsed, err := time.Parse(dateLayout, value)
+	if err != nil || parsed.Format(dateLayout) != value {
+		return "", ValidationError("%s", message)
+	}
+	return value, nil
+}
+
+// validateExactIdentifier applies the public identifier rules but reports the
+// given message verbatim.
+func validateExactIdentifier(value, message string) (string, error) {
+	if value == "" || len(value) > maxIdentifierLength {
+		return "", ValidationError("%s", message)
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < 0x21 || value[index] > 0x7e {
+			return "", ValidationError("%s", message)
+		}
+	}
+	return value, nil
+}
+
+// isCalendarMonth reports whether the window starts on the first day of a month
+// and ends on the last day of that same month.
+func isCalendarMonth(start, end string) bool {
+	startDate, err := time.Parse(dateLayout, start)
+	if err != nil {
+		return false
+	}
+	endDate, err := time.Parse(dateLayout, end)
+	if err != nil {
+		return false
+	}
+	if startDate.Day() != 1 {
+		return false
+	}
+	if startDate.Year() != endDate.Year() || startDate.Month() != endDate.Month() {
+		return false
+	}
+	return endDate.AddDate(0, 0, 1).Day() == 1
+}
+
 // StatementLine is one bank statement line. AmountMinor is signed: positive
 // means money into the account (a debit to it), negative means money out.
 type StatementLine struct {

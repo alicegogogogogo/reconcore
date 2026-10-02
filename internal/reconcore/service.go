@@ -309,63 +309,93 @@ type createJournalRequest struct {
 	Lines []*journalLineRequest `json:"lines"`
 }
 
-// CreateJournal posts an immutable voucher once it balances in the functional
-// currency.
-func (s *Service) CreateJournal(body []byte, key string) (any, error) {
+// parseJournalBody decodes a journal or adjustment request and runs the checks
+// that do not need state.
+func (s *Service) parseJournalBody(body []byte) (*createJournalRequest, string, string, string, error) {
 	var request createJournalRequest
 	if err := decodeObject(body, &request); err != nil {
-		return nil, err
+		return nil, "", "", "", err
 	}
 	id, err := validateIdentifier(request.ID, "journal id")
 	if err != nil {
-		return nil, err
+		return nil, "", "", "", err
 	}
 	date, err := validateDate(request.Date, "date")
 	if err != nil {
-		return nil, err
+		return nil, "", "", "", err
 	}
 	memo, err := validateText(request.Memo, "memo")
 	if err != nil {
-		return nil, err
+		return nil, "", "", "", err
 	}
 	if len(request.Lines) < 2 {
-		return nil, ValidationError("lines must contain at least two postings")
+		return nil, "", "", "", ValidationError("lines must contain at least two postings")
+	}
+	return &request, id, date, memo, nil
+}
+
+// insertJournal builds, balances and stores one voucher. The id uniqueness
+// check belongs to the caller because adjustment journals reuse this path.
+func (s *Service) insertJournal(state *State, id, date, memo string, lines []*journalLineRequest) (*Journal, error) {
+	journal := &Journal{
+		ID:                 id,
+		Date:               date,
+		Memo:               memo,
+		FunctionalCurrency: s.functionalCurrency,
+		Lines:              []*JournalLine{},
+		CreatedAt:          s.now(),
+	}
+	var debits, credits int64
+	for position, raw := range lines {
+		line, err := s.buildJournalLine(state, raw, position+1, date)
+		if err != nil {
+			return nil, err
+		}
+		if line.Side == "debit" {
+			debits += line.FunctionalAmountMinor
+		} else {
+			credits += line.FunctionalAmountMinor
+		}
+		journal.Lines = append(journal.Lines, line)
+	}
+	if debits != credits {
+		return nil, ValidationError(
+			"journal is not balanced in %s: debits %d, credits %d",
+			s.functionalCurrency, debits, credits,
+		)
+	}
+	journal.DebitFunctionalMinor = debits
+	journal.CreditFunctionalMinor = credits
+	state.Journals[id] = journal
+	return journal, nil
+}
+
+// periodCloseForDate returns the close record whose calendar month contains
+// date, or nil when the date is still open.
+func periodCloseForDate(state *State, date string) *PeriodClose {
+	for _, close := range state.PeriodCloses {
+		if date >= close.Period.Start && date <= close.Period.End {
+			return close
+		}
+	}
+	return nil
+}
+
+// CreateJournal posts an immutable voucher once it balances in the functional
+// currency.
+func (s *Service) CreateJournal(body []byte, key string) (any, error) {
+	request, id, date, memo, err := s.parseJournalBody(body)
+	if err != nil {
+		return nil, err
 	}
 	return s.runIdempotent(key, "create-journal:"+id, func(state *State) (any, error) {
 		if _, found := state.Journals[id]; found {
 			return nil, ConflictError("journal %s already exists", id)
 		}
-		journal := &Journal{
-			ID:                 id,
-			Date:               date,
-			Memo:               memo,
-			FunctionalCurrency: s.functionalCurrency,
-			Lines:              []*JournalLine{},
-			CreatedAt:          s.now(),
+		if periodCloseForDate(state, date) != nil {
+			return nil, ConflictError("closed period rejects journal")
 		}
-		var debits, credits int64
-		for position, raw := range request.Lines {
-			line, err := s.buildJournalLine(state, raw, position+1, date)
-			if err != nil {
-				return nil, err
-			}
-			if line.Side == "debit" {
-				debits += line.FunctionalAmountMinor
-			} else {
-				credits += line.FunctionalAmountMinor
-			}
-			journal.Lines = append(journal.Lines, line)
-		}
-		if debits != credits {
-			return nil, ValidationError(
-				"journal is not balanced in %s: debits %d, credits %d",
-				s.functionalCurrency, debits, credits,
-			)
-		}
-		journal.DebitFunctionalMinor = debits
-		journal.CreditFunctionalMinor = credits
-		state.Journals[id] = journal
-		return journal, nil
+		return s.insertJournal(state, id, date, memo, request.Lines)
 	})
 }
 
@@ -376,6 +406,98 @@ func (s *Service) GetJournal(id string) (any, error) {
 		if !found {
 			return nil, NotFoundError("journal %s was not found", id)
 		}
+		return journal, nil
+	})
+}
+
+type createPeriodCloseRequest struct {
+	ID     string        `json:"id"`
+	Period periodRequest `json:"period"`
+}
+
+// CreatePeriodClose closes one complete calendar month. Afterwards ordinary
+// journals are rejected for dates inside the month and only adjustment
+// journals posted through the record are accepted.
+func (s *Service) CreatePeriodClose(body []byte, key string) (any, error) {
+	var request createPeriodCloseRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	id, err := validateExactIdentifier(request.ID, "invalid period close id")
+	if err != nil {
+		return nil, err
+	}
+	start, err := validateExactDate(request.Period.Start, "invalid period date")
+	if err != nil {
+		return nil, err
+	}
+	end, err := validateExactDate(request.Period.End, "invalid period date")
+	if err != nil {
+		return nil, err
+	}
+	if !isCalendarMonth(start, end) {
+		return nil, ValidationError("period is not one calendar month")
+	}
+	return s.runIdempotent(key, "create-period-close:"+id, func(state *State) (any, error) {
+		if _, found := state.PeriodCloses[id]; found {
+			return nil, ConflictError("period close exists")
+		}
+		for _, existing := range state.PeriodCloses {
+			if existing.Period.Start == start {
+				return nil, ConflictError("calendar month is closed")
+			}
+		}
+		close := &PeriodClose{
+			ID:                   id,
+			Period:               Period{Start: start, End: end},
+			Status:               "closed",
+			ClosedAt:             s.now(),
+			AdjustmentCount:      0,
+			AdjustmentJournalIDs: []string{},
+		}
+		state.PeriodCloses[id] = close
+		return close, nil
+	})
+}
+
+// GetPeriodClose returns one stored close record.
+func (s *Service) GetPeriodClose(id string) (any, error) {
+	return s.store.View(func(state *State) (any, error) {
+		close, found := state.PeriodCloses[id]
+		if !found {
+			return nil, NotFoundError("period close not found")
+		}
+		return close, nil
+	})
+}
+
+// CreateAdjustment posts one balanced voucher into a closed period through its
+// close record and registers the journal on that record.
+func (s *Service) CreateAdjustment(closeID string, body []byte, key string) (any, error) {
+	request, id, date, memo, err := s.parseJournalBody(body)
+	if err != nil {
+		return nil, err
+	}
+	return s.runIdempotent(key, fmt.Sprintf("create-adjustment:%s:%s", closeID, id), func(state *State) (any, error) {
+		close, found := state.PeriodCloses[closeID]
+		if !found {
+			return nil, NotFoundError("period close not found")
+		}
+		if memo == "" {
+			return nil, ValidationError("adjustment memo required")
+		}
+		if date < close.Period.Start || date > close.Period.End {
+			return nil, ValidationError("adjustment date outside period")
+		}
+		if _, found := state.Journals[id]; found {
+			return nil, ConflictError("journal exists")
+		}
+		journal, err := s.insertJournal(state, id, date, memo, request.Lines)
+		if err != nil {
+			return nil, err
+		}
+		close.AdjustmentCount++
+		close.AdjustmentJournalIDs = append(close.AdjustmentJournalIDs, id)
 		return journal, nil
 	})
 }

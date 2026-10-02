@@ -13,6 +13,8 @@ The initial release intentionally supports a compact public contract:
 - exchange rates come from dated snapshots, or from an explicit rate on a posting line;
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
+- a calendar month can be closed: ordinary journals are then rejected for the
+  month and only adjustment journals posted through the close record enter it;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -112,6 +114,19 @@ the statement side the ledger does not explain: `0` for `timing`,
 `missing_in_ledger`, and the negated ledger amount for `missing_in_statement`.
 `status` is `balanced` when there is no difference at all, otherwise
 `differences_found`.
+
+**Period closes.** `POST /period-closes` closes exactly one complete calendar
+month, given as `period.start` on day 1 and `period.end` on the last day of the
+same month; the record is immutable. Once a month is closed, `POST /journals`
+rejects any journal dated inside it with `conflict`
+(`closed period rejects journal`), while journals dated outside the month post
+normally. Adjustments still enter the closed month through
+`POST /period-closes/{id}/adjustments`: the body is a normal journal body
+(`id`, `date`, non-empty `memo`, `lines`) with the same rate resolution,
+rounding, two-line minimum and functional-currency balancing rules, and the
+date must fall inside the closed month. Every accepted adjustment is a normal
+immutable journal readable via `GET /journals/{id}` and counted on the close
+record in `adjustment_count` and `adjustment_journal_ids`.
 
 ## HTTP API
 
@@ -277,6 +292,51 @@ Returns HTTP 201 with the frozen result:
 `GET /reconciliations/{id}` returns the stored reconciliation unchanged, even
 after more journals are posted; create a new reconciliation to refresh it.
 
+### Close a period
+
+```http
+POST /period-closes
+Idempotency-Key: close-2024-02
+
+{"id":"pc-2024-02","period":{"start":"2024-02-01","end":"2024-02-29"}}
+```
+
+Returns HTTP 201 with the close record. `status` is `closed` and stays that
+way; `adjustment_count` starts at 0 and `adjustment_journal_ids` starts empty.
+`GET /period-closes/{id}` returns the same record, updated as adjustments
+arrive.
+
+```json
+{"id":"pc-2024-02","period":{"start":"2024-02-01","end":"2024-02-29"},
+ "status":"closed","closed_at":"2024-06-01T12:00:00Z",
+ "adjustment_count":0,"adjustment_journal_ids":[]}
+```
+
+The same `id` cannot be used twice (`period close exists`), and the same
+calendar month cannot be closed twice (`calendar month is closed`). A period
+that is not exactly one calendar month is rejected with
+`period is not one calendar month`.
+
+### Post an adjustment into a closed period
+
+```http
+POST /period-closes/pc-2024-02/adjustments
+Idempotency-Key: adj-1
+
+{"id":"jv-adj-1","date":"2024-02-15","memo":"accrue missing bank fee",
+ "lines":[
+   {"account_id":"5000","side":"debit","amount_minor":1200},
+   {"account_id":"1100","side":"credit","amount_minor":1200}
+ ]}
+```
+
+Returns HTTP 201 with the stored journal, exactly like `POST /journals`. The
+`memo` is required (`adjustment memo required`), the date must fall inside the
+closed month (`adjustment date outside period`), an existing journal id is
+rejected with `journal exists`, and all other journal validation keeps its
+original codes and messages. After success the close record carries the new
+journal id and an incremented count.
+
 ## Errors
 
 Errors use this shape:
@@ -287,9 +347,9 @@ Errors use this shape:
 
 | Code | Status | Raised when |
 | --- | --- | --- |
-| `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
-| `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, or an idempotency key reused for another operation |
+| `validation_error` | 400 | the body or a parameter violates the contract, including `invalid period close id`, `invalid period date`, `period is not one calendar month`, `adjustment memo required` or `adjustment date outside period`, or the idempotency key is missing |
+| `not_found` | 404 | unknown route, unknown id, or `period close not found` |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, an idempotency key reused for another operation, a second close of the same calendar month (`calendar month is closed`), `journal exists`, or `closed period rejects journal` for an ordinary journal dated in a closed month |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests
