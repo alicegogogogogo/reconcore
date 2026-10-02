@@ -739,6 +739,180 @@ func TestUnknownFieldsAndQueryParameters(t *testing.T) {
 		400, "validation_error", "unknown query parameter")
 }
 
+func TestPeriodCloseAndAdjustments(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-jan","date":"2024-01-10",
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":100000},
+			{"account_id":"4000","side":"credit","amount_minor":100000}
+		]}`)
+
+	close := client.created("/period-closes", `{"id":"pc-2024-01","period":{"start":"2024-01-01","end":"2024-01-31"}}`)
+	if text(t, close, "status") != "closed" || text(t, close, "closed_at") == "" {
+		t.Fatalf("period close is %v", close)
+	}
+	if integer(t, close, "adjustment_count") != 0 || len(objects(t, close, "adjustment_journal_ids")) != 0 {
+		t.Fatalf("fresh period close has adjustments: %v", close)
+	}
+	period, ok := close["period"].(map[string]any)
+	if !ok || period["start"] != "2024-01-01" || period["end"] != "2024-01-31" {
+		t.Fatalf("period is %v", close["period"])
+	}
+	if got := text(t, client.ok("/period-closes/pc-2024-01"), "id"); got != "pc-2024-01" {
+		t.Fatalf("stored period close id is %s", got)
+	}
+
+	// Ordinary journals dated inside the closed month are rejected; other
+	// dates still post.
+	client.expect(
+		request{method: http.MethodPost, path: "/journals", key: "closed-jan", body: `{
+			"id":"jv-late","date":"2024-01-31",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":100},
+				{"account_id":"4000","side":"credit","amount_minor":100}
+			]}`},
+		409, "conflict", "closed period rejects journal",
+	)
+	client.created("/journals", `{
+		"id":"jv-feb","date":"2024-02-01",
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":100},
+			{"account_id":"4000","side":"credit","amount_minor":100}
+		]}`)
+
+	// An adjustment enters the closed month through the close itself.
+	adjustment := client.created("/period-closes/pc-2024-01/adjustments", `{
+		"id":"jv-adj-1","date":"2024-01-31","memo":"accrue January interest",
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":5000},
+			{"account_id":"4000","side":"credit","amount_minor":5000}
+		]}`)
+	if text(t, adjustment, "memo") != "accrue January interest" {
+		t.Fatalf("adjustment journal is %v", adjustment)
+	}
+	if got := text(t, client.ok("/journals/jv-adj-1"), "id"); got != "jv-adj-1" {
+		t.Fatalf("adjustment is not readable as a journal: %s", got)
+	}
+	updated := client.ok("/period-closes/pc-2024-01")
+	if integer(t, updated, "adjustment_count") != 1 {
+		t.Fatalf("adjustment count is %v", updated["adjustment_count"])
+	}
+	rawIDs, ok := updated["adjustment_journal_ids"].([]any)
+	if !ok || len(rawIDs) != 1 || rawIDs[0] != "jv-adj-1" {
+		t.Fatalf("adjustment journal ids are %v", updated["adjustment_journal_ids"])
+	}
+	balance := client.ok("/accounts/1000/balance?as_of=2024-01-31")
+	if integer(t, balance, "net_minor") != 105000 {
+		t.Fatalf("January balance misses the adjustment: %v", balance)
+	}
+
+	// Validation and conflict messages of the close itself.
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "bad-id",
+			body: `{"id":"has space","period":{"start":"2024-03-01","end":"2024-03-31"}}`},
+		400, "validation_error", "invalid period close id",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "bad-date",
+			body: `{"id":"pc-bad","period":{"start":"2024-03-01","end":"2024-03-32"}}`},
+		400, "validation_error", "invalid period date",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "partial",
+			body: `{"id":"pc-partial","period":{"start":"2024-03-01","end":"2024-03-30"}}`},
+		400, "validation_error", "period is not one calendar month",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "spanning",
+			body: `{"id":"pc-span","period":{"start":"2024-03-01","end":"2024-04-30"}}`},
+		400, "validation_error", "period is not one calendar month",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "dup-close",
+			body: `{"id":"pc-2024-01","period":{"start":"2024-01-01","end":"2024-01-31"}}`},
+		409, "conflict", "period close exists",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes", key: "same-month",
+			body: `{"id":"pc-again","period":{"start":"2024-01-01","end":"2024-01-31"}}`},
+		409, "conflict", "calendar month is closed",
+	)
+	client.expect(request{method: http.MethodGet, path: "/period-closes/pc-2024-02"}, 404, "not_found", "period close not found")
+
+	// Adjustment validation.
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes/pc-2024-02/adjustments", key: "adj-unknown", body: `{
+			"id":"jv-adj-2","date":"2024-01-15","memo":"x",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":1},
+				{"account_id":"4000","side":"credit","amount_minor":1}
+			]}`},
+		404, "not_found", "period close not found",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes/pc-2024-01/adjustments", key: "adj-memo", body: `{
+			"id":"jv-adj-2","date":"2024-01-15",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":1},
+				{"account_id":"4000","side":"credit","amount_minor":1}
+			]}`},
+		400, "validation_error", "adjustment memo required",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes/pc-2024-01/adjustments", key: "adj-date", body: `{
+			"id":"jv-adj-2","date":"2024-02-01","memo":"late",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":1},
+				{"account_id":"4000","side":"credit","amount_minor":1}
+			]}`},
+		400, "validation_error", "adjustment date outside period",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes/pc-2024-01/adjustments", key: "adj-dup", body: `{
+			"id":"jv-jan","date":"2024-01-15","memo":"duplicate",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":1},
+				{"account_id":"4000","side":"credit","amount_minor":1}
+			]}`},
+		409, "conflict", "journal exists",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes/pc-2024-01/adjustments", key: "adj-unbalanced", body: `{
+			"id":"jv-adj-2","date":"2024-01-15","memo":"unbalanced",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":100},
+				{"account_id":"4000","side":"credit","amount_minor":90}
+			]}`},
+		400, "validation_error", "not balanced in CNY",
+	)
+
+	// Idempotency: replay returns the first response, reuse elsewhere conflicts.
+	firstStatus, firstRaw, _ := client.send(request{method: http.MethodPost, path: "/period-closes", key: "pc-replay",
+		body: `{"id":"pc-2024-03","period":{"start":"2024-03-01","end":"2024-03-31"}}`})
+	secondStatus, secondRaw, _ := client.send(request{method: http.MethodPost, path: "/period-closes", key: "pc-replay",
+		body: `{"id":"pc-2024-03","period":{"start":"2024-04-01","end":"2024-04-30"}}`})
+	if firstStatus != http.StatusCreated || secondStatus != http.StatusCreated || firstRaw != secondRaw {
+		t.Fatalf("replay did not return the first response: %d %s then %d %s", firstStatus, firstRaw, secondStatus, secondRaw)
+	}
+	client.expect(
+		request{method: http.MethodPost, path: "/journals", key: "pc-replay", body: `{
+			"id":"jv-x","date":"2024-05-02",
+			"lines":[
+				{"account_id":"1000","side":"debit","amount_minor":1},
+				{"account_id":"4000","side":"credit","amount_minor":1}
+			]}`},
+		409, "conflict", "already used for another operation",
+	)
+	client.expect(
+		request{method: http.MethodPost, path: "/period-closes",
+			body: `{"id":"pc-2024-06","period":{"start":"2024-06-01","end":"2024-06-30"}}`},
+		400, "validation_error", "Idempotency-Key",
+	)
+}
+
 func TestDatabaseSurvivesReopen(t *testing.T) {
 	database := filepath.Join(t.TempDir(), "ledger.db")
 	client := newClientOn(t, database)

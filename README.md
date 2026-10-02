@@ -93,6 +93,15 @@ Journals dated after `as_of` are not read at all.
 Line amounts are signed: positive is money into the account (a debit to it),
 negative is money out. Line ids must be unique inside the statement.
 
+**Period closes.** `POST /period-closes` freezes one calendar month: `period`
+must be exactly one natural month, first day to last day, and each month can be
+closed only once. Once a month is closed, an ordinary journal dated
+inside it is rejected with `closed period rejects journal`. Adjustments still
+enter the closed month through `POST /period-closes/{id}/adjustments`, which
+follows every ordinary journal rule and additionally requires a non-empty
+`memo` and a `date` inside the closed period. The close records
+`adjustment_count` and `adjustment_journal_ids` as adjustments are posted.
+
 **Reconciliation.** `POST /reconciliations` matches one statement against the
 ledger lines of the statement's account whose journal date falls inside the
 statement period, then freezes the result. Matching is deterministic, in three
@@ -229,6 +238,47 @@ Returns HTTP 201 with the stored journal. Both lines are in USD, so the
 A journal whose functional debits and credits differ returns HTTP 400, for
 example `journal is not balanced in CNY: debits 100000, credits 90000`.
 
+### Close a period
+
+```http
+POST /period-closes
+Idempotency-Key: close-1
+
+{"id":"pc-2024-01","period":{"start":"2024-01-01","end":"2024-01-31"}}
+```
+
+Returns HTTP 201 with the stored close; `GET /period-closes/{id}` returns it.
+The period must be exactly one calendar month and the month must not be closed
+already.
+
+```json
+{"id":"pc-2024-01","period":{"start":"2024-01-01","end":"2024-01-31"},
+ "status":"closed","closed_at":"2024-06-01T12:00:00Z",
+ "adjustment_count":0,"adjustment_journal_ids":[]}
+```
+
+After a month is closed, `POST /journals` dated inside it returns HTTP 409
+with `closed period rejects journal`.
+
+### Post an adjustment into a closed period
+
+```http
+POST /period-closes/pc-2024-01/adjustments
+Idempotency-Key: adj-1
+
+{"id":"jv-adj-1","date":"2024-01-31","memo":"accrue January interest",
+ "lines":[
+   {"account_id":"1000","side":"debit","amount_minor":5000},
+   {"account_id":"4000","side":"credit","amount_minor":5000}
+ ]}
+```
+
+Returns HTTP 201 with the stored journal, readable through
+`GET /journals/{id}` like any other voucher, and increments the close's
+`adjustment_count` and `adjustment_journal_ids`. The adjustment follows every
+ordinary journal rule; `memo` must be non-empty and `date` must fall inside
+the closed period.
+
 ### Import a bank statement
 
 ```http
@@ -289,7 +339,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal dated in a closed period, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests

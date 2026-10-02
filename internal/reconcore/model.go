@@ -107,6 +107,18 @@ type Period struct {
 	End   string `json:"end"`
 }
 
+// PeriodClose freezes one calendar month. Once a close exists, ordinary
+// journals dated inside the period are rejected and only adjustment journals
+// posted through the close itself are appended to it.
+type PeriodClose struct {
+	ID                   string   `json:"id"`
+	Period               Period   `json:"period"`
+	Status               string   `json:"status"`
+	ClosedAt             string   `json:"closed_at"`
+	AdjustmentCount      int      `json:"adjustment_count"`
+	AdjustmentJournalIDs []string `json:"adjustment_journal_ids"`
+}
+
 // StatementLine is one bank statement line. AmountMinor is signed: positive
 // means money into the account (a debit to it), negative means money out.
 type StatementLine struct {
