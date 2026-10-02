@@ -70,6 +70,16 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.GetBalance(parts[1], request.URL.Query().Get("as_of"))
 		return http.StatusOK, response, err
 
+	case method == http.MethodGet && len(parts) == 2 && parts[0] == "reports" && parts[1] == "trial-balance":
+		if err := requireQuery(request, "as_of"); err != nil {
+			return 0, nil, err
+		}
+		if values := request.URL.Query()["as_of"]; len(values) > 1 {
+			return 0, nil, ValidationError("as_of query parameter must be supplied at most once")
+		}
+		response, err := s.service.GetTrialBalance(request.URL.Query().Get("as_of"))
+		return http.StatusOK, response, err
+
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "journals":
 		body, err := readJSONBody(request)
 		if err != nil {

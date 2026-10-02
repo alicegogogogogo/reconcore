@@ -234,6 +234,69 @@ func (s *Service) computeBalance(state *State, account *Account, asOf string) *B
 	return balance
 }
 
+// GetTrialBalance derives the read-only trial balance at asOf from stored
+// accounts and immutable journals. Every account gets one row of its own direct
+// postings; child accounts never roll into a parent.
+func (s *Service) GetTrialBalance(asOf string) (any, error) {
+	if asOf == "" {
+		return nil, ValidationError("as_of query parameter is required")
+	}
+	date, err := validateDate(asOf, "as_of")
+	if err != nil {
+		return nil, err
+	}
+	return s.store.View(func(state *State) (any, error) {
+		return s.computeTrialBalance(state, date), nil
+	})
+}
+
+func (s *Service) computeTrialBalance(state *State, asOf string) *TrialBalance {
+	report := &TrialBalance{
+		AsOf:               asOf,
+		FunctionalCurrency: s.functionalCurrency,
+		Accounts:           []*TrialBalanceRow{},
+	}
+	for _, account := range sortedAccounts(state) {
+		row := &TrialBalanceRow{
+			AccountID:   account.ID,
+			AccountName: account.Name,
+			Currency:    account.Currency,
+		}
+		for _, journal := range sortedJournals(state) {
+			if journal.Date > asOf {
+				continue
+			}
+			for _, line := range journal.Lines {
+				if line.AccountID != account.ID {
+					continue
+				}
+				row.PostingCount++
+				if line.Side == "debit" {
+					row.DebitMinor += line.AmountMinor
+					row.FunctionalDebitMinor += line.FunctionalAmountMinor
+				} else {
+					row.CreditMinor += line.AmountMinor
+					row.FunctionalCreditMinor += line.FunctionalAmountMinor
+				}
+			}
+		}
+		row.NetMinor = row.DebitMinor - row.CreditMinor
+		row.FunctionalNetMinor = row.FunctionalDebitMinor - row.FunctionalCreditMinor
+		report.Accounts = append(report.Accounts, row)
+		report.PostingCount += row.PostingCount
+		if row.FunctionalNetMinor >= 0 {
+			report.FunctionalDebitTotalMinor += row.FunctionalNetMinor
+		} else {
+			report.FunctionalCreditTotalMinor += -row.FunctionalNetMinor
+		}
+	}
+	report.Status = "balanced"
+	if report.FunctionalDebitTotalMinor != report.FunctionalCreditTotalMinor {
+		report.Status = "unbalanced"
+	}
+	return report
+}
+
 type createRateRequest struct {
 	Base  string `json:"base"`
 	Quote string `json:"quote"`

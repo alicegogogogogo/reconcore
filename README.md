@@ -12,6 +12,7 @@ The initial release intentionally supports a compact public contract:
 - a journal is stored only when its debit and credit totals agree in the functional currency;
 - exchange rates come from dated snapshots, or from an explicit rate on a posting line;
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
+- a read-only trial balance report lists every account at an `as_of` date and totals the stored functional amounts;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
 - duplicate commands with the same idempotency key return the original result.
 
@@ -86,6 +87,22 @@ in journals with `date <= as_of` and returns `debit_minor`, `credit_minor`,
 `normal_balance`, so a credit-normal account grows when credited), `posting_count`,
 the first and last posting date, and the same totals in the functional currency.
 Journals dated after `as_of` are not read at all.
+
+**Trial balance.** `GET /reports/trial-balance?as_of=` is read-only and derives
+one row per stored account from the immutable journals with `date <= as_of`.
+Rows are ordered by account id and each lists `account_id`, `account_name`,
+`currency`, the local-currency `debit_minor`, `credit_minor`, `net_minor`
+(debits minus credits), the functional-currency
+`functional_debit_minor`, `functional_credit_minor`, `functional_net_minor`, and
+`posting_count` (the number of direct journal lines). Only direct postings count:
+child accounts never roll into a parent. The top level carries `as_of`,
+`functional_currency`, `posting_count` (the sum of the row counts) and the two
+functional totals. `functional_debit_total_minor` sums `functional_net_minor` of
+every row that is zero or positive, and `functional_credit_total_minor` sums the
+absolute value of every negative row; `status` is `balanced` when the two totals
+are equal, otherwise `unbalanced`. An empty ledger returns an empty `accounts`
+array with all totals zero and `balanced`. The report writes no state, so the
+same `as_of` is recomputed from current data after new journals are posted.
 
 **Statements.** `POST /statements` imports one statement for one account.
 `period` is `{start, end}` and every line date must fall inside it.
@@ -185,6 +202,40 @@ GET /accounts/1200/balance?as_of=2024-01-31
  "functional_credit_minor":0,"functional_net_minor":724500,"posting_count":1,
  "first_posting_date":"2024-01-15","last_posting_date":"2024-01-15"}
 ```
+
+### Read the trial balance
+
+```http
+GET /reports/trial-balance?as_of=2024-01-31
+```
+
+`as_of` is required, must be a single `YYYY-MM-DD` date, and is the only query
+parameter. Every account gets one row ordered by account id, built solely from
+its own direct journal lines dated on or before `as_of`; sub-accounts do not
+roll into parents. The functional fields reuse the conversion result stored on
+each journal line.
+
+```json
+{"as_of":"2024-01-31","functional_currency":"CNY",
+ "functional_debit_total_minor":724500,
+ "functional_credit_total_minor":724500,"posting_count":2,"status":"balanced",
+ "accounts":[
+   {"account_id":"1200","account_name":"USD cash","currency":"USD",
+    "debit_minor":100000,"credit_minor":0,"net_minor":100000,
+    "functional_debit_minor":724500,"functional_credit_minor":0,
+    "functional_net_minor":724500,"posting_count":1},
+   {"account_id":"4200","account_name":"USD revenue","currency":"USD",
+    "debit_minor":0,"credit_minor":100000,"net_minor":-100000,
+    "functional_debit_minor":0,"functional_credit_minor":724500,
+    "functional_net_minor":-724500,"posting_count":1}]}
+```
+
+The debit total adds the non-negative `functional_net_minor` rows and the credit
+total adds the absolute value of the negative rows; `status` is `balanced` when
+they agree and `unbalanced` otherwise. A missing, malformed, duplicated or
+unknown query parameter returns HTTP 400 with `validation_error`. The report is
+read-only and writes nothing, so posting more journals makes the same `as_of`
+recompute from the new state.
 
 ### Store an exchange rate snapshot
 

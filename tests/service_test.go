@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -737,6 +738,281 @@ func TestUnknownFieldsAndQueryParameters(t *testing.T) {
 	)
 	client.expect(request{method: http.MethodGet, path: "/accounts/1000/balance?as_of=2024-01-01&to=2024-02-01"},
 		400, "validation_error", "unknown query parameter")
+}
+
+func TestTrialBalanceEmptyLedger(t *testing.T) {
+	client := newClient(t)
+
+	report := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	if text(t, report, "as_of") != "2024-12-31" {
+		t.Fatalf("as_of is %v", report["as_of"])
+	}
+	if text(t, report, "functional_currency") != "CNY" {
+		t.Fatalf("functional currency is %v", report["functional_currency"])
+	}
+	if len(objects(t, report, "accounts")) != 0 {
+		t.Fatalf("empty ledger must return no accounts, got %v", report["accounts"])
+	}
+	for name, want := range map[string]int64{
+		"functional_debit_total_minor":  0,
+		"functional_credit_total_minor": 0,
+		"posting_count":                 0,
+	} {
+		if integer(t, report, name) != want {
+			t.Fatalf("empty ledger %s is %v, want %d", name, report[name], want)
+		}
+	}
+	if text(t, report, "status") != "balanced" {
+		t.Fatalf("empty ledger status is %v", report["status"])
+	}
+}
+
+func TestTrialBalanceRowsTotalsAndStatus(t *testing.T) {
+	client := newClient(t)
+	// 1000 is a CNY parent; 1100 is its CNY child; 1200 is a USD account; 4200
+	// is a USD revenue account.
+	client.created("/accounts", accountBody("1000", "Assets", "asset", "CNY"))
+	client.created("/accounts", `{"id":"1100","name":"Cash","type":"asset","parent_id":"1000","currency":"CNY"}`)
+	client.created("/accounts", accountBody("1200", "USD cash", "asset", "USD"))
+	client.created("/accounts", accountBody("4200", "USD revenue", "revenue", "USD"))
+	client.created("/rates", `{"base":"USD","quote":"CNY","date":"2024-01-01","rate":"7.245"}`)
+
+	client.created("/journals", `{
+		"id":"jv-cny","date":"2024-01-15",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000},
+			{"account_id":"1000","side":"credit","amount_minor":100000}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-usd","date":"2024-01-20",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":100000},
+			{"account_id":"4200","side":"credit","amount_minor":100000}
+		]}`)
+	// February journals must stay out of the January as_of report.
+	client.created("/journals", `{
+		"id":"jv-feb","date":"2024-02-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":250000},
+			{"account_id":"1000","side":"credit","amount_minor":250000}
+		]}`)
+
+	report := client.ok("/reports/trial-balance?as_of=2024-01-31")
+	rows := objects(t, report, "accounts")
+	if len(rows) != 4 {
+		t.Fatalf("expected one row per account, got %v", rows)
+	}
+	wantOrder := []string{"1000", "1100", "1200", "4200"}
+	for index, wantID := range wantOrder {
+		if text(t, rows[index], "account_id") != wantID {
+			t.Fatalf("row %d is %v, want %s", index, rows[index]["account_id"], wantID)
+		}
+	}
+
+	byID := map[string]map[string]any{}
+	for _, row := range rows {
+		byID[text(t, row, "account_id")] = row
+	}
+	parent := byID["1000"]
+	if text(t, parent, "account_name") != "Assets" || text(t, parent, "currency") != "CNY" {
+		t.Fatalf("parent row is %v", parent)
+	}
+	if integer(t, parent, "debit_minor") != 0 || integer(t, parent, "credit_minor") != 100000 {
+		t.Fatalf("parent must count only its own direct postings: %v", parent)
+	}
+	if integer(t, parent, "net_minor") != -100000 || integer(t, parent, "functional_net_minor") != -100000 {
+		t.Fatalf("parent net is %v", parent)
+	}
+	if integer(t, parent, "posting_count") != 1 {
+		t.Fatalf("parent posting_count is %v", parent["posting_count"])
+	}
+	child := byID["1100"]
+	if integer(t, child, "debit_minor") != 100000 || integer(t, child, "credit_minor") != 0 {
+		t.Fatalf("child must not roll into the parent but keeps its own posting: %v", child)
+	}
+	if integer(t, child, "net_minor") != 100000 || integer(t, child, "posting_count") != 1 {
+		t.Fatalf("child net/count is %v", child)
+	}
+	usd := byID["1200"]
+	if text(t, usd, "currency") != "USD" {
+		t.Fatalf("usd row currency is %v", usd["currency"])
+	}
+	if integer(t, usd, "debit_minor") != 100000 || integer(t, usd, "functional_debit_minor") != 724500 {
+		t.Fatalf("usd row keeps local and functional totals: %v", usd)
+	}
+	if integer(t, usd, "functional_credit_minor") != 0 || integer(t, usd, "functional_net_minor") != 724500 {
+		t.Fatalf("usd row functional net is %v", usd)
+	}
+	revenue := byID["4200"]
+	if integer(t, revenue, "functional_net_minor") != -724500 || integer(t, revenue, "posting_count") != 1 {
+		t.Fatalf("usd revenue row is %v", revenue)
+	}
+
+	if integer(t, report, "functional_debit_total_minor") != 824500 {
+		t.Fatalf("debit total is %v, want 824500", report["functional_debit_total_minor"])
+	}
+	if integer(t, report, "functional_credit_total_minor") != 824500 {
+		t.Fatalf("credit total is %v, want 824500", report["functional_credit_total_minor"])
+	}
+	if integer(t, report, "posting_count") != 4 {
+		t.Fatalf("top level posting_count is %v, want 4", report["posting_count"])
+	}
+	if text(t, report, "status") != "balanced" {
+		t.Fatalf("balanced journals report %v", report["status"])
+	}
+
+	// The later as_of recomputes from current state and includes February.
+	later := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	if integer(t, later, "functional_debit_total_minor") != 1074500 ||
+		integer(t, later, "functional_credit_total_minor") != 1074500 {
+		t.Fatalf("year-end totals are %v", later)
+	}
+	if integer(t, later, "posting_count") != 6 {
+		t.Fatalf("year-end posting_count is %v", later["posting_count"])
+	}
+}
+
+func TestTrialBalanceStatusWhenFunctionalTotalsDiffer(t *testing.T) {
+	// Every journal the API stores balances in the functional currency, so the
+	// unbalanced branch only appears for externally tampered state. Seed a
+	// database whose single voucher has functional debit 100 against credit 90.
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	contents := `{
+	  "accounts": {
+	    "1000": {"id":"1000","name":"Cash","type":"asset","parent_id":null,"currency":"CNY","normal_balance":"debit","created_at":"2024-06-01T12:00:00Z"},
+	    "2000": {"id":"2000","name":"Loan","type":"liability","parent_id":null,"currency":"CNY","normal_balance":"credit","created_at":"2024-06-01T12:00:00Z"}
+	  },
+	  "journals": {
+	    "jv-bad": {
+	      "id":"jv-bad","date":"2024-01-15","functional_currency":"CNY",
+	      "debit_functional_minor":100,"credit_functional_minor":90,
+	      "created_at":"2024-06-01T12:00:00Z",
+	      "lines":[
+	        {"index":1,"account_id":"1000","side":"debit","amount_minor":100,"currency":"CNY",
+	         "rate":"1","rate_numerator":1,"rate_denominator":1,"rate_source":"identity",
+	         "functional_amount_minor":100},
+	        {"index":2,"account_id":"2000","side":"credit","amount_minor":90,"currency":"CNY",
+	         "rate":"1","rate_numerator":1,"rate_denominator":1,"rate_source":"identity",
+	         "functional_amount_minor":90}
+	      ]
+	    }
+	  },
+	  "rates": [],
+	  "statements": {},
+	  "reconciliations": {},
+	  "period_closes": {},
+	  "idempotency": {}
+	}`
+	if err := os.WriteFile(database, []byte(contents), 0o600); err != nil {
+		t.Fatalf("seed database: %v", err)
+	}
+	client := newClientOn(t, database)
+
+	report := client.ok("/reports/trial-balance?as_of=2024-01-31")
+	rows := objects(t, report, "accounts")
+	if len(rows) != 2 {
+		t.Fatalf("expected two rows, got %v", rows)
+	}
+	if integer(t, report, "functional_debit_total_minor") != 100 {
+		t.Fatalf("debit total sums non-negative functional nets: %v", report["functional_debit_total_minor"])
+	}
+	if integer(t, report, "functional_credit_total_minor") != 90 {
+		t.Fatalf("credit total sums absolute negative functional nets: %v", report["functional_credit_total_minor"])
+	}
+	if integer(t, report, "posting_count") != 2 {
+		t.Fatalf("posting count is %v, want 2", report["posting_count"])
+	}
+	if text(t, report, "status") != "unbalanced" {
+		t.Fatalf("unequal functional totals must report unbalanced, got %v", report["status"])
+	}
+}
+
+func TestTrialBalanceIsReadOnly(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+
+	first := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	second := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	if fmt.Sprint(first) != fmt.Sprint(second) {
+		t.Fatalf("repeat reads differ: %v vs %v", first, second)
+	}
+
+	// After a new voucher the same as_of recomputes from current state.
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-05-10",
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":700},
+			{"account_id":"4000","side":"credit","amount_minor":700}
+		]}`)
+	after := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	if integer(t, after, "posting_count") != 2 {
+		t.Fatalf("report must reflect the new voucher, got %v", after)
+	}
+	// The earlier as_of that predates the voucher is unaffected.
+	before := client.ok("/reports/trial-balance?as_of=2024-04-30")
+	if integer(t, before, "posting_count") != 0 || text(t, before, "status") != "balanced" {
+		t.Fatalf("earlier as_of must stay empty and balanced: %v", before)
+	}
+
+	// Reading reports creates no idempotency records or other state.
+	store, err := reconcore.OpenStore(database)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	service, err := reconcore.NewService(store, "CNY", func() time.Time { return fixedClock })
+	if err != nil {
+		t.Fatalf("reopen service: %v", err)
+	}
+	report, err := service.GetTrialBalance("2024-12-31")
+	if err != nil {
+		t.Fatalf("get trial balance after reopen: %v", err)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("encode trial balance: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("decode trial balance: %v", err)
+	}
+	if integer(t, decoded, "posting_count") != 2 || text(t, decoded, "status") != "balanced" {
+		t.Fatalf("reopened trial balance is %v", decoded)
+	}
+}
+
+func TestTrialBalanceQueryValidation(t *testing.T) {
+	client := newClient(t)
+
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance"},
+		400, "validation_error", "as_of query parameter is required",
+	)
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance?as_of=2024-02-30"},
+		400, "validation_error", "ISO 8601",
+	)
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance?as_of=01-31-2024"},
+		400, "validation_error", "ISO 8601",
+	)
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance?as_of=2024-01-31&as_of=2024-02-01"},
+		400, "validation_error", "at most once",
+	)
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance?as_of=2024-01-31&to=2024-02-01"},
+		400, "validation_error", "unknown query parameter",
+	)
+	client.expect(
+		request{method: http.MethodGet, path: "/reports/trial-balance?to=2024-02-01"},
+		400, "validation_error", "unknown query parameter",
+	)
+	client.expect(request{method: http.MethodGet, path: "/reports"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/reports/trial-balance/extra"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/reports/other"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodPost, path: "/reports/trial-balance"}, 404, "not_found", "")
 }
 
 func TestPeriodCloseAndAdjustments(t *testing.T) {
