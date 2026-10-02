@@ -12,6 +12,8 @@ The initial release intentionally supports a compact public contract:
 - a journal is stored only when its debit and credit totals agree in the functional currency;
 - exchange rates come from dated snapshots, or from an explicit rate on a posting line;
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
+- `GET /reports/trial-balance` is a read-only as-of report that sums the stored
+  functional amounts of every account and never writes state;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
 - duplicate commands with the same idempotency key return the original result.
 
@@ -86,6 +88,22 @@ in journals with `date <= as_of` and returns `debit_minor`, `credit_minor`,
 `normal_balance`, so a credit-normal account grows when credited), `posting_count`,
 the first and last posting date, and the same totals in the functional currency.
 Journals dated after `as_of` are not read at all.
+
+**Trial balance.** `GET /reports/trial-balance?as_of=` is read-only and is
+recomputed from the stored accounts and immutable journals on every call; it
+never writes state. Every account gets one row ordered by account id, even when
+it has no postings, and child accounts are not rolled into their parent. Only
+lines of journals with `date <= as_of` are counted. Each row carries
+`account_id`, `account_name`, `currency`, the account-currency
+`debit_minor`, `credit_minor` and `net_minor` (debits minus credits), the
+functional totals stored on the lines (`functional_debit_minor`,
+`functional_credit_minor`, `functional_net_minor`) and `posting_count`. The
+footer reports `as_of`, `functional_currency`, `functional_debit_total_minor`
+(sum of every non-negative `functional_net_minor`),
+`functional_credit_total_minor` (sum of the absolute value of every negative
+row), the sum of every row's `posting_count`, and `status`: `balanced` when the
+two functional totals are equal, otherwise `unbalanced`. An empty ledger
+returns an empty `accounts` array and all-zero totals.
 
 **Statements.** `POST /statements` imports one statement for one account.
 `period` is `{start, end}` and every line date must fall inside it.
@@ -184,6 +202,32 @@ GET /accounts/1200/balance?as_of=2024-01-31
  "balance_minor":100000,"functional_debit_minor":724500,
  "functional_credit_minor":0,"functional_net_minor":724500,"posting_count":1,
  "first_posting_date":"2024-01-15","last_posting_date":"2024-01-15"}
+```
+
+### Read the trial balance
+
+```http
+GET /reports/trial-balance?as_of=2024-01-31
+```
+
+A read-only report over every account. Accounts are ordered by id, child
+accounts stay on their own row, and only journals dated on or before `as_of`
+count. A missing, malformed or repeated `as_of`, or any unknown query
+parameter, returns HTTP 400 with `validation_error`.
+
+```json
+{"as_of":"2024-01-31","functional_currency":"CNY","accounts":[
+  {"account_id":"1200","account_name":"USD cash","currency":"USD",
+   "debit_minor":100000,"credit_minor":0,"net_minor":100000,
+   "functional_debit_minor":724500,"functional_credit_minor":0,
+   "functional_net_minor":724500,"posting_count":1},
+  {"account_id":"4200","account_name":"USD revenue","currency":"USD",
+   "debit_minor":0,"credit_minor":100000,"net_minor":-100000,
+   "functional_debit_minor":0,"functional_credit_minor":724500,
+   "functional_net_minor":-724500,"posting_count":1}],
+ "functional_debit_total_minor":724500,
+ "functional_credit_total_minor":724500,
+ "posting_count":2,"status":"balanced"}
 ```
 
 ### Store an exchange rate snapshot

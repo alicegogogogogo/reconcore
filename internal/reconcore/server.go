@@ -70,6 +70,13 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.GetBalance(parts[1], request.URL.Query().Get("as_of"))
 		return http.StatusOK, response, err
 
+	case method == http.MethodGet && len(parts) == 2 && parts[0] == "reports" && parts[1] == "trial-balance":
+		if err := requireSingleQuery(request, "as_of"); err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.GetTrialBalance(request.URL.Query().Get("as_of"))
+		return http.StatusOK, response, err
+
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "journals":
 		body, err := readJSONBody(request)
 		if err != nil {
@@ -199,6 +206,21 @@ func requireQuery(request *http.Request, allowed ...string) error {
 		}
 		if !known {
 			return ValidationError("unknown query parameter %s", name)
+		}
+	}
+	return nil
+}
+
+// requireSingleQuery rejects unknown query parameters and repeated values for
+// the single documented parameter, so its value can be trusted as a scalar.
+func requireSingleQuery(request *http.Request, name string) error {
+	query := request.URL.Query()
+	if len(query[name]) > 1 {
+		return ValidationError("query parameter %s must appear exactly once", name)
+	}
+	for candidate := range query {
+		if candidate != name {
+			return ValidationError("unknown query parameter %s", candidate)
 		}
 	}
 	return nil

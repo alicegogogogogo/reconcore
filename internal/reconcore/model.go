@@ -205,6 +205,35 @@ type Balance struct {
 	LastPostingDate       string `json:"last_posting_date,omitempty"`
 }
 
+// TrialBalanceRow is one account's line on the trial balance report. Only
+// journal lines posted directly to the account are summed; child accounts
+// never roll up into their parent.
+type TrialBalanceRow struct {
+	AccountID             string `json:"account_id"`
+	AccountName           string `json:"account_name"`
+	Currency              string `json:"currency"`
+	DebitMinor            int64  `json:"debit_minor"`
+	CreditMinor           int64  `json:"credit_minor"`
+	NetMinor              int64  `json:"net_minor"`
+	FunctionalDebitMinor  int64  `json:"functional_debit_minor"`
+	FunctionalCreditMinor int64  `json:"functional_credit_minor"`
+	FunctionalNetMinor    int64  `json:"functional_net_minor"`
+	PostingCount          int    `json:"posting_count"`
+}
+
+// TrialBalance is the read-only as-of trial balance. The debit total collects
+// every row with a non-negative functional net, the credit total collects the
+// absolute value of every negative row.
+type TrialBalance struct {
+	AsOf                       string             `json:"as_of"`
+	FunctionalCurrency         string             `json:"functional_currency"`
+	Accounts                   []*TrialBalanceRow `json:"accounts"`
+	FunctionalDebitTotalMinor  int64              `json:"functional_debit_total_minor"`
+	FunctionalCreditTotalMinor int64              `json:"functional_credit_total_minor"`
+	PostingCount               int                `json:"posting_count"`
+	Status                     string             `json:"status"`
+}
+
 // decodeObject decodes exactly one JSON object and rejects unknown fields,
 // trailing content and non-object bodies.
 func decodeObject(body []byte, target any) error {

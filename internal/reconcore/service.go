@@ -234,6 +234,71 @@ func (s *Service) computeBalance(state *State, account *Account, asOf string) *B
 	return balance
 }
 
+// GetTrialBalance derives a read-only trial balance at asOf from the stored
+// accounts and immutable journals. It never writes state and is recomputed
+// from the current ledgers on every call.
+func (s *Service) GetTrialBalance(asOf string) (any, error) {
+	if asOf == "" {
+		return nil, ValidationError("as_of query parameter is required")
+	}
+	date, err := validateDate(asOf, "as_of")
+	if err != nil {
+		return nil, err
+	}
+	return s.store.View(func(state *State) (any, error) {
+		rows := make(map[string]*TrialBalanceRow, len(state.Accounts))
+		ordered := make([]*TrialBalanceRow, 0, len(state.Accounts))
+		for _, account := range sortedAccounts(state) {
+			row := &TrialBalanceRow{
+				AccountID:   account.ID,
+				AccountName: account.Name,
+				Currency:    account.Currency,
+			}
+			rows[account.ID] = row
+			ordered = append(ordered, row)
+		}
+		for _, journal := range sortedJournals(state) {
+			if journal.Date > date {
+				continue
+			}
+			for _, line := range journal.Lines {
+				row := rows[line.AccountID]
+				if row == nil {
+					return nil, InternalError("journal %s posts to unknown account %s", journal.ID, line.AccountID)
+				}
+				row.PostingCount++
+				if line.Side == "debit" {
+					row.DebitMinor += line.AmountMinor
+					row.FunctionalDebitMinor += line.FunctionalAmountMinor
+				} else {
+					row.CreditMinor += line.AmountMinor
+					row.FunctionalCreditMinor += line.FunctionalAmountMinor
+				}
+			}
+		}
+		report := &TrialBalance{
+			AsOf:               date,
+			FunctionalCurrency: s.functionalCurrency,
+			Accounts:           ordered,
+		}
+		for _, row := range ordered {
+			row.NetMinor = row.DebitMinor - row.CreditMinor
+			row.FunctionalNetMinor = row.FunctionalDebitMinor - row.FunctionalCreditMinor
+			report.PostingCount += row.PostingCount
+			if row.FunctionalNetMinor >= 0 {
+				report.FunctionalDebitTotalMinor += row.FunctionalNetMinor
+			} else {
+				report.FunctionalCreditTotalMinor += -row.FunctionalNetMinor
+			}
+		}
+		report.Status = "balanced"
+		if report.FunctionalDebitTotalMinor != report.FunctionalCreditTotalMinor {
+			report.Status = "unbalanced"
+		}
+		return report, nil
+	})
+}
+
 type createRateRequest struct {
 	Base  string `json:"base"`
 	Quote string `json:"quote"`
