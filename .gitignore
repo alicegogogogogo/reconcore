@@ -1,0 +1,7 @@
+# compiled binary
+/reconcore
+/reconcore.exe
+
+# local database files produced by the service
+*.db
+*.db.tmp
