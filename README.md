@@ -14,6 +14,9 @@ The initial release intentionally supports a compact public contract:
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
 - `GET /reports/trial-balance` is a read-only as-of report that sums the stored
   functional amounts of every account and never writes state;
+- `GET /reports/financial-statements` is a read-only month-end balance sheet
+  and income statement that reuses the stored functional amounts, posts no
+  voucher and changes no period close;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
 - duplicate commands with the same idempotency key return the original result.
 
@@ -104,6 +107,28 @@ footer reports `as_of`, `functional_currency`, `functional_debit_total_minor`
 row), the sum of every row's `posting_count`, and `status`: `balanced` when the
 two functional totals are equal, otherwise `unbalanced`. An empty ledger
 returns an empty `accounts` array and all-zero totals.
+
+**Financial statements.** `GET /reports/financial-statements` is read-only and
+is recomputed from the stored accounts and immutable journals on every call; it
+never writes a snapshot, posts a voucher or changes a period close. It takes
+`as_of`, `period_start` and `period_end`, each exactly once, where
+`period_start <= period_end <= as_of`. The balance sheet counts every journal
+dated on or before `as_of`; the income statement counts only journals dated
+inside the closed interval `[period_start, period_end]`. All amounts are the
+functional amounts already stored on the journal lines, so no exchange rate is
+ever recomputed. Every account gets one row in the section for its type
+(`assets`, `liabilities`, `equity`, `revenue`, `expenses`), ordered by account
+id, even with no postings, and child accounts are not rolled into their parent.
+Each row carries `account_id`, `account_name`, `parent_id`, `currency` and
+`functional_balance_minor`: debit minus credit for assets and expenses, credit
+minus debit for the rest. The footer reports `assets_total_minor`,
+`liabilities_total_minor`, `equity_total_minor` (equity credit minus debit plus
+revenue minus expenses up to `as_of`), `balance_check_minor` (assets minus
+liabilities minus that equity total) and the balance sheet `status`
+(`balanced` when the check is zero, otherwise `unbalanced`), plus
+`revenue_total_minor`, `expenses_total_minor` and `net_income_minor` for the
+named period. An empty ledger returns empty sections, all-zero totals and a
+`balanced` balance sheet.
 
 **Statements.** `POST /statements` imports one statement for one account.
 `period` is `{start, end}` and every line date must fall inside it.
@@ -229,6 +254,42 @@ parameter, returns HTTP 400 with `validation_error`.
  "functional_credit_total_minor":724500,
  "posting_count":2,"status":"balanced"}
 ```
+
+### Read the month-end financial statements
+
+```http
+GET /reports/financial-statements?as_of=2024-01-31&period_start=2024-01-01&period_end=2024-01-31
+```
+
+A read-only balance sheet at `as_of` together with an income statement over the
+closed period. The three parameters must each appear exactly once as
+`YYYY-MM-DD` dates satisfying `period_start <= period_end <= as_of`; a missing,
+malformed or repeated parameter, an unknown parameter, or an illegal interval
+returns HTTP 400 with `validation_error`, reporting the first problem in
+`as_of`, `period_start`, `period_end` order. Accounts are ordered by id, child
+accounts stay on their own row, and balances reuse the functional amounts
+stored on the journal lines. With opening equity of 100000, January revenue of
+100000 and January rent of 30000 posted to cash:
+
+```json
+{"functional_currency":"CNY",
+ "balance_sheet":{"as_of":"2024-01-31",
+   "assets":[{"account_id":"1100","account_name":"Cash","parent_id":null,
+     "currency":"CNY","functional_balance_minor":170000}],
+   "liabilities":[],
+   "equity":[{"account_id":"3000","account_name":"Equity","parent_id":null,
+     "currency":"CNY","functional_balance_minor":100000}],
+   "assets_total_minor":170000,"liabilities_total_minor":0,
+   "equity_total_minor":170000,"balance_check_minor":0,"status":"balanced"},
+ "income_statement":{"period_start":"2024-01-01","period_end":"2024-01-31",
+   "revenue":[{"account_id":"4000","account_name":"Revenue","parent_id":null,
+     "currency":"CNY","functional_balance_minor":100000}],
+   "expenses":[{"account_id":"5000","account_name":"Rent","parent_id":null,
+     "currency":"CNY","functional_balance_minor":30000}],
+   "revenue_total_minor":100000,"expenses_total_minor":30000,
+   "net_income_minor":70000}}
+```
+
 
 ### Store an exchange rate snapshot
 

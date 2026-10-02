@@ -299,6 +299,154 @@ func (s *Service) GetTrialBalance(asOf string) (any, error) {
 	})
 }
 
+// GetFinancialStatements derives the read-only month-end balance sheet and
+// income statement from the stored accounts and immutable journals. It never
+// writes a snapshot, posts a voucher or changes a period close. The balance
+// sheet sees every journal dated on or before asOf; the income statement sees
+// only journals dated inside [periodStart, periodEnd].
+func (s *Service) GetFinancialStatements(asOf, periodStart, periodEnd string) (any, error) {
+	if asOf == "" {
+		return nil, ValidationError("as_of query parameter is required")
+	}
+	asOfDate, err := validateDate(asOf, "as_of")
+	if err != nil {
+		return nil, err
+	}
+	if periodStart == "" {
+		return nil, ValidationError("period_start query parameter is required")
+	}
+	startDate, err := validateDate(periodStart, "period_start")
+	if err != nil {
+		return nil, err
+	}
+	if periodEnd == "" {
+		return nil, ValidationError("period_end query parameter is required")
+	}
+	endDate, err := validateDate(periodEnd, "period_end")
+	if err != nil {
+		return nil, err
+	}
+	if startDate > endDate {
+		return nil, ValidationError("period_start must not be after period_end")
+	}
+	if endDate > asOfDate {
+		return nil, ValidationError("period_end must not be after as_of")
+	}
+	return s.store.View(func(state *State) (any, error) {
+		// Each account accumulates its functional debit and credit totals for
+		// the as-of window and for the income-statement period.
+		type totals struct {
+			asOfDebit, asOfCredit     int64
+			periodDebit, periodCredit int64
+		}
+		accumulator := make(map[string]*totals, len(state.Accounts))
+		for _, account := range sortedAccounts(state) {
+			accumulator[account.ID] = &totals{}
+		}
+		for _, journal := range sortedJournals(state) {
+			if journal.Date > asOfDate {
+				continue
+			}
+			inPeriod := journal.Date >= startDate && journal.Date <= endDate
+			for _, line := range journal.Lines {
+				sum := accumulator[line.AccountID]
+				if sum == nil {
+					return nil, InternalError("journal %s posts to unknown account %s", journal.ID, line.AccountID)
+				}
+				if line.Side == "debit" {
+					sum.asOfDebit += line.FunctionalAmountMinor
+					if inPeriod {
+						sum.periodDebit += line.FunctionalAmountMinor
+					}
+				} else {
+					sum.asOfCredit += line.FunctionalAmountMinor
+					if inPeriod {
+						sum.periodCredit += line.FunctionalAmountMinor
+					}
+				}
+			}
+		}
+
+		balanceSheet := &BalanceSheet{
+			AsOf:        asOfDate,
+			Assets:      []*FinancialStatementRow{},
+			Liabilities: []*FinancialStatementRow{},
+			Equity:      []*FinancialStatementRow{},
+		}
+		incomeStatement := &IncomeStatement{
+			PeriodStart: startDate,
+			PeriodEnd:   endDate,
+			Revenue:     []*FinancialStatementRow{},
+			Expenses:    []*FinancialStatementRow{},
+		}
+
+		// orient returns the functional balance the way a statement presents
+		// it: debit minus credit for debit-normal types, credit minus debit
+		// for credit-normal types.
+		orient := func(account *Account, debit, credit int64) int64 {
+			if account.NormalBalance == "debit" {
+				return debit - credit
+			}
+			return credit - debit
+		}
+
+		var revenueAsOf, expensesAsOf int64
+		for _, account := range sortedAccounts(state) {
+			sum := accumulator[account.ID]
+			row := func(balance int64) *FinancialStatementRow {
+				return &FinancialStatementRow{
+					AccountID:              account.ID,
+					AccountName:            account.Name,
+					ParentID:               account.ParentID,
+					Currency:               account.Currency,
+					FunctionalBalanceMinor: balance,
+				}
+			}
+			switch account.Type {
+			case "asset":
+				balance := orient(account, sum.asOfDebit, sum.asOfCredit)
+				balanceSheet.Assets = append(balanceSheet.Assets, row(balance))
+				balanceSheet.AssetsTotalMinor += balance
+			case "liability":
+				balance := orient(account, sum.asOfDebit, sum.asOfCredit)
+				balanceSheet.Liabilities = append(balanceSheet.Liabilities, row(balance))
+				balanceSheet.LiabilitiesTotalMinor += balance
+			case "equity":
+				balance := orient(account, sum.asOfDebit, sum.asOfCredit)
+				balanceSheet.Equity = append(balanceSheet.Equity, row(balance))
+				balanceSheet.EquityTotalMinor += balance
+			case "revenue":
+				revenueAsOf += orient(account, sum.asOfDebit, sum.asOfCredit)
+				periodBalance := orient(account, sum.periodDebit, sum.periodCredit)
+				incomeStatement.Revenue = append(incomeStatement.Revenue, row(periodBalance))
+				incomeStatement.RevenueTotalMinor += periodBalance
+			case "expense":
+				expensesAsOf += orient(account, sum.asOfDebit, sum.asOfCredit)
+				periodBalance := orient(account, sum.periodDebit, sum.periodCredit)
+				incomeStatement.Expenses = append(incomeStatement.Expenses, row(periodBalance))
+				incomeStatement.ExpensesTotalMinor += periodBalance
+			}
+		}
+
+		// Equity keeps the result retained up to as_of: equity postings plus
+		// revenue minus expenses.
+		balanceSheet.EquityTotalMinor += revenueAsOf - expensesAsOf
+		incomeStatement.NetIncomeMinor = incomeStatement.RevenueTotalMinor - incomeStatement.ExpensesTotalMinor
+
+		balanceSheet.BalanceCheckMinor = balanceSheet.AssetsTotalMinor - balanceSheet.LiabilitiesTotalMinor - balanceSheet.EquityTotalMinor
+		balanceSheet.Status = "balanced"
+		if balanceSheet.BalanceCheckMinor != 0 {
+			balanceSheet.Status = "unbalanced"
+		}
+
+		return &FinancialStatements{
+			FunctionalCurrency: s.functionalCurrency,
+			BalanceSheet:       balanceSheet,
+			IncomeStatement:    incomeStatement,
+		}, nil
+	})
+}
+
 type createRateRequest struct {
 	Base  string `json:"base"`
 	Quote string `json:"quote"`

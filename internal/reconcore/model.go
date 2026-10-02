@@ -234,6 +234,53 @@ type TrialBalance struct {
 	Status                     string             `json:"status"`
 }
 
+// FinancialStatementRow is one account's line on the month-end financial
+// statements. FunctionalBalanceMinor is the signed functional balance oriented
+// the way the statement presents it: debit minus credit for assets and
+// expenses, credit minus debit for liabilities, equity and revenue.
+type FinancialStatementRow struct {
+	AccountID              string  `json:"account_id"`
+	AccountName            string  `json:"account_name"`
+	ParentID               *string `json:"parent_id"`
+	Currency               string  `json:"currency"`
+	FunctionalBalanceMinor int64   `json:"functional_balance_minor"`
+}
+
+// BalanceSheet is the as-of position statement. EquityTotalMinor keeps the
+// period result inside equity: equity credits minus debits plus revenue minus
+// expenses up to as_of. BalanceCheckMinor is assets minus liabilities minus
+// that equity total.
+type BalanceSheet struct {
+	AsOf                  string                   `json:"as_of"`
+	Assets                []*FinancialStatementRow `json:"assets"`
+	Liabilities           []*FinancialStatementRow `json:"liabilities"`
+	Equity                []*FinancialStatementRow `json:"equity"`
+	AssetsTotalMinor      int64                    `json:"assets_total_minor"`
+	LiabilitiesTotalMinor int64                    `json:"liabilities_total_minor"`
+	EquityTotalMinor      int64                    `json:"equity_total_minor"`
+	BalanceCheckMinor     int64                    `json:"balance_check_minor"`
+	Status                string                   `json:"status"`
+}
+
+// IncomeStatement is the closed period result: revenue minus expenses posted
+// inside [PeriodStart, PeriodEnd].
+type IncomeStatement struct {
+	PeriodStart        string                   `json:"period_start"`
+	PeriodEnd          string                   `json:"period_end"`
+	Revenue            []*FinancialStatementRow `json:"revenue"`
+	Expenses           []*FinancialStatementRow `json:"expenses"`
+	RevenueTotalMinor  int64                    `json:"revenue_total_minor"`
+	ExpensesTotalMinor int64                    `json:"expenses_total_minor"`
+	NetIncomeMinor     int64                    `json:"net_income_minor"`
+}
+
+// FinancialStatements bundles the two read-only month-end statements.
+type FinancialStatements struct {
+	FunctionalCurrency string           `json:"functional_currency"`
+	BalanceSheet       *BalanceSheet    `json:"balance_sheet"`
+	IncomeStatement    *IncomeStatement `json:"income_statement"`
+}
+
 // decodeObject decodes exactly one JSON object and rejects unknown fields,
 // trailing content and non-object bodies.
 func decodeObject(body []byte, target any) error {

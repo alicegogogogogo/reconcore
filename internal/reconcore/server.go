@@ -77,6 +77,16 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.GetTrialBalance(request.URL.Query().Get("as_of"))
 		return http.StatusOK, response, err
 
+	case method == http.MethodGet && len(parts) == 2 && parts[0] == "reports" && parts[1] == "financial-statements":
+		if err := requireQueries(request, "as_of", "period_start", "period_end"); err != nil {
+			return 0, nil, err
+		}
+		query := request.URL.Query()
+		response, err := s.service.GetFinancialStatements(
+			query.Get("as_of"), query.Get("period_start"), query.Get("period_end"),
+		)
+		return http.StatusOK, response, err
+
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "journals":
 		body, err := readJSONBody(request)
 		if err != nil {
@@ -222,6 +232,34 @@ func requireSingleQuery(request *http.Request, name string) error {
 		if candidate != name {
 			return ValidationError("unknown query parameter %s", candidate)
 		}
+	}
+	return nil
+}
+
+// requireQueries is requireSingleQuery for a fixed list of scalar parameters:
+// every documented name must appear at most once and nothing else is allowed.
+// Cardinality is checked in documented order so the first repeated parameter
+// is the one named in the error.
+func requireQueries(request *http.Request, names ...string) error {
+	query := request.URL.Query()
+	for _, name := range names {
+		if len(query[name]) > 1 {
+			return ValidationError("query parameter %s must appear exactly once", name)
+		}
+	}
+	known := map[string]bool{}
+	for _, name := range names {
+		known[name] = true
+	}
+	unknown := make([]string, 0, len(query))
+	for candidate := range query {
+		if !known[candidate] {
+			unknown = append(unknown, candidate)
+		}
+	}
+	sort.Strings(unknown)
+	if len(unknown) > 0 {
+		return ValidationError("unknown query parameter %s", unknown[0])
 	}
 	return nil
 }
