@@ -187,6 +187,36 @@ type Reconciliation struct {
 	CreatedAt          string            `json:"created_at"`
 }
 
+// Resolution is the immutable human disposition of one frozen difference. The
+// Difference field is a deep snapshot of the difference as it was frozen in
+// the reconciliation, so later journals, statements or reconciliations can
+// never change what was reviewed. A resolution can never be updated or
+// deleted once stored.
+type Resolution struct {
+	ID               string      `json:"id"`
+	ReconciliationID string      `json:"reconciliation_id"`
+	DifferenceIndex  int         `json:"difference_index"`
+	Disposition      string      `json:"disposition"`
+	Reason           string      `json:"reason"`
+	Difference       *Difference `json:"difference"`
+	CreatedAt        string      `json:"created_at"`
+}
+
+// copyDifference deep-copies one frozen difference so a resolution snapshot
+// shares no memory with the reconciliation it was taken from.
+func copyDifference(difference *Difference) *Difference {
+	copied := *difference
+	if difference.StatementAmountMinor != nil {
+		amount := *difference.StatementAmountMinor
+		copied.StatementAmountMinor = &amount
+	}
+	if difference.LedgerAmountMinor != nil {
+		amount := *difference.LedgerAmountMinor
+		copied.LedgerAmountMinor = &amount
+	}
+	return &copied
+}
+
 // Balance is the derived position of one account at one date.
 type Balance struct {
 	AccountID             string `json:"account_id"`

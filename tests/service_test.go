@@ -1682,3 +1682,269 @@ func TestJournalReversalAndReconciliation(t *testing.T) {
 		t.Fatalf("fresh differences are %v", differences)
 	}
 }
+
+// setupResolvableReconciliation creates a reconciliation with exactly two
+// frozen differences: index 1 is missing_in_ledger (s2) and index 2 is
+// missing_in_statement (jv-2#1).
+func setupResolvableReconciliation(t *testing.T, client *client) {
+	t.Helper()
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-2","date":"2024-03-15",
+		"lines":[
+			{"account_id":"1100","side":"credit","amount_minor":12000,"reference":"INV-5"},
+			{"account_id":"4000","side":"debit","amount_minor":12000,"reference":"INV-5"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":107000,
+		"lines":[
+			{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"},
+			{"id":"s2","date":"2024-03-10","amount_minor":7000,"reference":"INV-2"}
+		]}`)
+	reconciliation := client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+	if text(t, reconciliation, "status") != "differences_found" || len(objects(t, reconciliation, "differences")) != 2 {
+		t.Fatalf("reconciliation is %v", reconciliation)
+	}
+}
+
+func resolutionBody(id string, index int, disposition, reason string) string {
+	return fmt.Sprintf(`{"id":%q,"difference_index":%d,"disposition":%q,"reason":%q}`,
+		id, index, disposition, reason)
+}
+
+func TestResolutionLifecycle(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+
+	// Review the second difference first; the listing must still sort by index.
+	resolved := client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-2", 2, "resolved", "corrected outside the system"))
+	if text(t, resolved, "reconciliation_id") != "rec-1" || text(t, resolved, "id") != "res-2" {
+		t.Fatalf("resolution is %v", resolved)
+	}
+	if integer(t, resolved, "difference_index") != 2 || text(t, resolved, "disposition") != "resolved" {
+		t.Fatalf("resolution is %v", resolved)
+	}
+	if text(t, resolved, "reason") != "corrected outside the system" {
+		t.Fatalf("resolution reason is %v", resolved["reason"])
+	}
+	if text(t, resolved, "created_at") != "2024-06-01T12:00:00Z" {
+		t.Fatalf("resolution created_at is %v", resolved["created_at"])
+	}
+	snapshot, ok := resolved["difference"].(map[string]any)
+	if !ok {
+		t.Fatalf("resolution snapshot is %v", resolved["difference"])
+	}
+	if text(t, snapshot, "type") != "missing_in_statement" || text(t, snapshot, "ledger_line_id") != "jv-2#1" {
+		t.Fatalf("snapshot is %v", snapshot)
+	}
+	if integer(t, snapshot, "difference_minor") != 12000 || integer(t, snapshot, "ledger_amount_minor") != -12000 {
+		t.Fatalf("snapshot amounts are %v", snapshot)
+	}
+
+	progress := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, progress, "difference_count") != 2 || integer(t, progress, "disposed_count") != 1 {
+		t.Fatalf("progress is %v", progress)
+	}
+	if integer(t, progress, "remaining_count") != 1 || text(t, progress, "review_status") != "pending" {
+		t.Fatalf("progress is %v", progress)
+	}
+
+	accepted := client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "  timing difference is expected  "))
+	if text(t, accepted, "reason") != "timing difference is expected" {
+		t.Fatalf("reason was not trimmed: %q", accepted["reason"])
+	}
+	firstSnapshot, ok := accepted["difference"].(map[string]any)
+	if !ok || text(t, firstSnapshot, "type") != "missing_in_ledger" || text(t, firstSnapshot, "statement_line_id") != "s2" {
+		t.Fatalf("first snapshot is %v", accepted["difference"])
+	}
+
+	done := client.ok("/reconciliations/rec-1/resolutions")
+	if text(t, done, "review_status") != "completed" || integer(t, done, "remaining_count") != 0 {
+		t.Fatalf("completed review is %v", done)
+	}
+	if integer(t, done, "difference_count") != 2 || integer(t, done, "disposed_count") != 2 {
+		t.Fatalf("completed review is %v", done)
+	}
+	records := objects(t, done, "records")
+	if len(records) != 2 || text(t, records[0], "id") != "res-1" || text(t, records[1], "id") != "res-2" {
+		t.Fatalf("records are not sorted by difference_index: %v", records)
+	}
+	if integer(t, records[0], "difference_index") != 1 || integer(t, records[1], "difference_index") != 2 {
+		t.Fatalf("record indexes are %v", records)
+	}
+
+	// The frozen reconciliation itself is untouched by the resolutions.
+	frozen := client.ok("/reconciliations/rec-1")
+	if text(t, frozen, "status") != "differences_found" || len(objects(t, frozen, "differences")) != 2 {
+		t.Fatalf("frozen reconciliation changed: %v", frozen)
+	}
+	if integer(t, frozen, "difference_minor") != 19000 {
+		t.Fatalf("frozen reconciliation changed: %v", frozen)
+	}
+}
+
+func TestResolutionIdempotencyAndConflicts(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+
+	body := resolutionBody("res-1", 1, "accepted", "confirmed")
+	firstStatus, firstRaw, _ := client.send(request{
+		method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "res-replay", body: body})
+	secondStatus, secondRaw, _ := client.send(request{
+		method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "res-replay", body: body})
+	if firstStatus != http.StatusCreated || secondStatus != http.StatusCreated {
+		t.Fatalf("idempotent statuses are %d and %d", firstStatus, secondStatus)
+	}
+	if firstRaw != secondRaw {
+		t.Fatalf("replayed response %s differs from %s", secondRaw, firstRaw)
+	}
+	progress := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, progress, "disposed_count") != 1 {
+		t.Fatalf("replay created a second resolution: %v", progress)
+	}
+
+	// The same key used for another operation conflicts.
+	sharedStatus, sharedRaw, _ := client.send(request{method: http.MethodPost, path: "/accounts", key: "shared",
+		body: accountBody("9999", "Other", "asset", "CNY")})
+	if sharedStatus != http.StatusCreated {
+		t.Fatalf("shared-key account returned %d: %s", sharedStatus, sharedRaw)
+	}
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "shared",
+		body: resolutionBody("res-9", 2, "accepted", "reuse")}, 409, "conflict", "already used for another operation")
+
+	// A reused resolution id conflicts, as does a second disposition of the
+	// same difference, and neither writes anything.
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "dup-id",
+		body: resolutionBody("res-1", 2, "resolved", "different difference")}, 409, "conflict", "already exists")
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "dup-diff",
+		body: resolutionBody("res-2", 1, "resolved", "second opinion")}, 409, "conflict", "already has resolution")
+	progress = client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, progress, "disposed_count") != 1 || len(objects(t, progress, "records")) != 1 {
+		t.Fatalf("conflicts wrote records: %v", progress)
+	}
+}
+
+func TestResolutionValidation(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+
+	post := func(key, body string) {
+		client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions",
+			key: key, body: body}, 400, "validation_error", "")
+	}
+	post("v-1", resolutionBody("res-v1", 0, "accepted", "zero index"))
+	post("v-2", resolutionBody("res-v2", -1, "accepted", "negative index"))
+	post("v-3", resolutionBody("res-v3", 3, "accepted", "out of range"))
+	post("v-4", `{"id":"res-v4","difference_index":1.5,"disposition":"accepted","reason":"fraction"}`)
+	post("v-5", `{"id":"res-v5","difference_index":"1","disposition":"accepted","reason":"string"}`)
+	post("v-6", resolutionBody("res-v6", 1, "ignored", "bad disposition"))
+	post("v-7", resolutionBody("res-v7", 1, "accepted", "   "))
+	post("v-8", resolutionBody("", 1, "accepted", "missing id"))
+	post("v-9", `{"id":"res-v9","difference_index":1,"disposition":"accepted","reason":"x","note":"extra"}`)
+	post("v-10", `{"difference_index":1,"disposition":"accepted","reason":"missing id field"}`)
+
+	// A missing idempotency key is a validation error too.
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions",
+		body: resolutionBody("res-v11", 1, "accepted", "no key")}, 400, "validation_error", "Idempotency-Key")
+
+	// None of the rejected requests wrote anything.
+	progress := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, progress, "disposed_count") != 0 || integer(t, progress, "remaining_count") != 2 {
+		t.Fatalf("validation failures wrote records: %v", progress)
+	}
+	if text(t, progress, "review_status") != "pending" {
+		t.Fatalf("review status is %v", progress)
+	}
+
+	// Unknown reconciliations and stray query parameters.
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-9/resolutions", key: "v-12",
+		body: resolutionBody("res-v12", 1, "accepted", "ghost")}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/reconciliations/rec-9/resolutions"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/reconciliations/rec-1/resolutions?status=pending"},
+		400, "validation_error", "unknown query parameter")
+}
+
+func TestResolutionOnBalancedReconciliation(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":100000,
+		"lines":[{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"}]}`)
+	client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+
+	progress := client.ok("/reconciliations/rec-1/resolutions")
+	if len(objects(t, progress, "records")) != 0 {
+		t.Fatalf("balanced reconciliation has records: %v", progress)
+	}
+	if integer(t, progress, "difference_count") != 0 || integer(t, progress, "disposed_count") != 0 ||
+		integer(t, progress, "remaining_count") != 0 {
+		t.Fatalf("balanced counts are %v", progress)
+	}
+	if text(t, progress, "review_status") != "completed" {
+		t.Fatalf("balanced review status is %v", progress)
+	}
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "bal-1",
+		body: resolutionBody("res-1", 1, "accepted", "nothing to dispose")},
+		400, "validation_error", "out of range")
+}
+
+func TestResolutionsSurviveReopenAndLaterActivity(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	setupResolvableReconciliation(t, client)
+	created := client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "kept forever"))
+
+	// Later journals and a fresh reconciliation must not disturb the stored
+	// resolution or its snapshot.
+	client.created("/journals", `{
+		"id":"jv-3","date":"2024-03-10",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":7000,"reference":"INV-2"},
+			{"account_id":"4000","side":"credit","amount_minor":7000,"reference":"INV-2"}
+		]}`)
+	client.created("/reconciliations", `{"id":"rec-2","statement_id":"st-1"}`)
+
+	reopened := newClientOn(t, database)
+	progress := reopened.ok("/reconciliations/rec-1/resolutions")
+	records := objects(t, progress, "records")
+	if len(records) != 1 || integer(t, progress, "disposed_count") != 1 {
+		t.Fatalf("resolutions after reopen are %v", progress)
+	}
+	if text(t, progress, "review_status") != "pending" || integer(t, progress, "remaining_count") != 1 {
+		t.Fatalf("review status after reopen is %v", progress)
+	}
+	if !reflect.DeepEqual(records[0], created) {
+		t.Fatalf("stored resolution %v differs from the created one %v", records[0], created)
+	}
+	snapshot, ok := records[0]["difference"].(map[string]any)
+	if !ok || text(t, snapshot, "type") != "missing_in_ledger" || integer(t, snapshot, "difference_minor") != 7000 {
+		t.Fatalf("snapshot after reopen is %v", records[0]["difference"])
+	}
+
+	// The resolution id and the disposed difference stay taken after a restart.
+	reopened.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "late-1",
+		body: resolutionBody("res-1", 2, "resolved", "recycled id")}, 409, "conflict", "already exists")
+	reopened.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "late-2",
+		body: resolutionBody("res-2", 1, "resolved", "second opinion")}, 409, "conflict", "already has resolution")
+}

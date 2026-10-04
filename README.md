@@ -180,6 +180,20 @@ the statement side the ledger does not explain: `0` for `timing`,
 `status` is `balanced` when there is no difference at all, otherwise
 `differences_found`.
 
+**Resolutions.** `POST /reconciliations/{id}/resolutions` records the immutable
+human disposition of one frozen difference, addressed by its 1-based
+`difference_index` inside the reconciliation's `differences` array. The
+`disposition` is `accepted` (the difference is understood and stays) or
+`resolved` (the difference was handled outside the system), and `reason` must
+be non-empty after trimming whitespace. Each difference holds at most one
+resolution, a resolution id is unique, and a stored resolution can never be
+updated or deleted. The resolution carries a deep snapshot of the difference
+it disposes, so restarts, later journals and new reconciliations never change
+what was reviewed. `GET /reconciliations/{id}/resolutions` lists the
+resolutions ordered by `difference_index` together with `difference_count`,
+`disposed_count`, `remaining_count` and a `review_status` that is `completed`
+once every frozen difference is disposed and `pending` otherwise.
+
 ## HTTP API
 
 Bodies are JSON. Every state-changing `POST` requires an `Idempotency-Key`
@@ -500,6 +514,48 @@ Returns HTTP 201 with the frozen result:
 `GET /reconciliations/{id}` returns the stored reconciliation unchanged, even
 after more journals are posted; create a new reconciliation to refresh it.
 
+### Resolve a reconciliation difference
+
+```http
+POST /reconciliations/rec-1/resolutions
+Idempotency-Key: resolution-1
+
+{"id":"res-1","difference_index":1,"disposition":"resolved",
+ "reason":"fee was refunded outside the ledger"}
+```
+
+Returns HTTP 201 with the stored resolution, including a snapshot of the
+frozen difference it disposes:
+
+```json
+{"id":"res-1","reconciliation_id":"rec-1","difference_index":1,
+ "disposition":"resolved","reason":"fee was refunded outside the ledger",
+ "difference":{"type":"missing_in_ledger",
+   "detail":"the statement line has no journal line in the period",
+   "statement_line_id":"s2","statement_date":"2024-01-28",
+   "statement_amount_minor":-13000,"difference_minor":-13000},
+ "created_at":"2024-06-01T12:00:00Z"}
+```
+
+`difference_index` counts the frozen `differences` from 1; a non-positive or
+out-of-range index, an unsupported `disposition`, a blank `reason` or an
+unknown body field returns HTTP 400 and writes nothing. A reused resolution
+id or a difference that already has a resolution returns HTTP 409. Replaying
+the same `Idempotency-Key` returns the first response without double-counting.
+
+`GET /reconciliations/{id}/resolutions` accepts no query parameters and
+returns the review progress:
+
+```json
+{"reconciliation_id":"rec-1","records":[...],
+ "difference_count":1,"disposed_count":1,"remaining_count":0,
+ "review_status":"completed"}
+```
+
+`records` is sorted by `difference_index`; the counts always refer to the
+frozen differences. A balanced reconciliation returns empty `records`, zero
+counts and `review_status` `completed`.
+
 ## Errors
 
 Errors use this shape:
@@ -512,7 +568,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests
