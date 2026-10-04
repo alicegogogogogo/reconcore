@@ -18,6 +18,9 @@ type State struct {
 	Reconciliations map[string]*Reconciliation    `json:"reconciliations"`
 	PeriodCloses    map[string]*PeriodClose       `json:"period_closes"`
 	Idempotency     map[string]*IdempotencyRecord `json:"idempotency"`
+	// Reversals maps a reversed journal id onto the id of the reversal
+	// journal that undid it, so a journal can be reversed exactly once.
+	Reversals map[string]string `json:"reversals"`
 }
 
 func newState() *State {
@@ -29,6 +32,7 @@ func newState() *State {
 		Reconciliations: map[string]*Reconciliation{},
 		PeriodCloses:    map[string]*PeriodClose{},
 		Idempotency:     map[string]*IdempotencyRecord{},
+		Reversals:       map[string]string{},
 	}
 }
 
@@ -82,6 +86,9 @@ func (s *State) repair() {
 	}
 	if s.Idempotency == nil {
 		s.Idempotency = map[string]*IdempotencyRecord{}
+	}
+	if s.Reversals == nil {
+		s.Reversals = map[string]string{}
 	}
 }
 

@@ -83,7 +83,15 @@ supplied, an optional `rate` and an optional `reference`. Lines are numbered
 from 1 and a ledger line is identified as `"<journal id>#<index>"`. The journal
 is rejected unless `Σ debit functional = Σ credit functional`; both totals are
 returned as `debit_functional_minor` and `credit_functional_minor`. Journals are
-immutable and posting never rewrites history.
+immutable and posting never rewrites history. A posted journal can be undone
+exactly once by a reversal journal posted through
+`POST /journals/{id}/reversals`: the reversal copies every line with the debit
+and credit sides exchanged, keeps the stored rate fraction, `rate_source` and
+`functional_amount_minor` of each line (rates are never re-resolved at the
+reversal date), and carries `reversal_of` with the original journal id, so the
+two vouchers cancel exactly in both the original and the functional currency.
+A reversal cannot itself be reversed, and the reversal date must not be before
+the original date or inside a closed month.
 
 **Balances.** `GET /accounts/{id}/balance?as_of=` sums the lines of that account
 in journals with `date <= as_of` and returns `debit_minor`, `credit_minor`,
@@ -356,6 +364,49 @@ Returns HTTP 201 with the stored journal. Both lines are in USD, so the
 A journal whose functional debits and credits differ returns HTTP 400, for
 example `journal is not balanced in CNY: debits 100000, credits 90000`.
 
+### Reverse a journal
+
+```http
+POST /journals/jv-1/reversals
+Idempotency-Key: reversal-1
+
+{"id":"jv-1-r","date":"2024-02-10","memo":"customer cancelled"}
+```
+
+Creates exactly one reversal journal for the journal named in the path and
+returns HTTP 201 with it; `GET /journals/jv-1-r` returns the same document and
+the original journal is never modified. `id` follows the journal id rules,
+`date` must be a valid calendar date not before the original journal's date,
+and `memo` is a non-empty reason. Every line keeps the original `account_id`,
+`amount_minor`, `currency`, `reference`, resolved rate fraction, `rate_source`
+and `functional_amount_minor` with only `debit` and `credit` exchanged, so the
+reversal's functional debit total equals the original's credit total and the
+pair cancels exactly. Balances, the trial balance and the financial statements
+before the reversal date are unchanged; from that date on they include the
+reversal lines like any other posting.
+
+```json
+{"id":"jv-1-r","date":"2024-02-10","memo":"customer cancelled",
+ "functional_currency":"CNY","debit_functional_minor":724500,
+ "credit_functional_minor":724500,"reversal_of":"jv-1",
+ "created_at":"2024-06-01T12:00:00Z","lines":[
+   {"index":1,"account_id":"1200","side":"credit","amount_minor":100000,
+    "currency":"USD","rate":"","rate_numerator":1449,"rate_denominator":200,
+    "rate_source":"snapshot:2024-01-01","functional_amount_minor":724500,
+    "reference":"INV-1"},
+   {"index":2,"account_id":"4200","side":"debit","amount_minor":100000,
+    "currency":"USD","rate":"","rate_numerator":1449,"rate_denominator":200,
+    "rate_source":"snapshot:2024-01-01","functional_amount_minor":724500,
+    "reference":"INV-1"}]}
+```
+
+An unknown original id returns HTTP 404. A `date` before the original date is
+HTTP 400. HTTP 409 results — writing nothing — are a reused `id`, an original
+that is itself a reversal, an original that was already reversed, or a
+reversal date inside a closed month. The reversal journal and the record that
+the original has been reversed are persisted atomically, so a restart cannot
+allow a second reversal.
+
 ### Close a period
 
 ```http
@@ -457,7 +508,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal dated in a closed period, or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that is already reversed or is itself a reversal, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests

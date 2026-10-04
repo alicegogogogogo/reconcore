@@ -89,7 +89,8 @@ type JournalLine struct {
 	Reference             string `json:"reference,omitempty"`
 }
 
-// Journal is an immutable, balanced voucher.
+// Journal is an immutable, balanced voucher. ReversalOf names the journal this
+// voucher reverses; it is empty on every journal that is not a reversal.
 type Journal struct {
 	ID                    string         `json:"id"`
 	Date                  string         `json:"date"`
@@ -98,6 +99,7 @@ type Journal struct {
 	Lines                 []*JournalLine `json:"lines"`
 	DebitFunctionalMinor  int64          `json:"debit_functional_minor"`
 	CreditFunctionalMinor int64          `json:"credit_functional_minor"`
+	ReversalOf            string         `json:"reversal_of,omitempty"`
 	CreatedAt             string         `json:"created_at"`
 }
 
