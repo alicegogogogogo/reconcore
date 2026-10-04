@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1438,5 +1439,246 @@ func TestTrialBalanceUnbalancedFromCorruptStore(t *testing.T) {
 	}
 	if integer(t, byID["4000"], "functional_net_minor") != -60 {
 		t.Fatalf("revenue row is %v", byID["4000"])
+	}
+}
+
+func TestJournalReversal(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1200", "USD cash", "asset", "USD"))
+	client.created("/accounts", accountBody("4200", "USD revenue", "revenue", "USD"))
+	client.created("/rates", `{"base":"USD","quote":"CNY","date":"2024-01-01","rate":"7.0"}`)
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-01-15","memo":"sale",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4200","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	_, originalBefore, _ := client.get("/journals/jv-1")
+	trialBefore := client.ok("/reports/trial-balance?as_of=2024-02-28")
+
+	// A newer rate snapshot must not change what the reversal posts.
+	client.created("/rates", `{"base":"USD","quote":"CNY","date":"2024-02-01","rate":"8.0"}`)
+
+	status, raw, reversal := client.send(request{
+		method: http.MethodPost, path: "/journals/jv-1/reversals", key: "rev-1",
+		body: `{"id":"jv-1-r","date":"2024-03-01","memo":"cancel the sale"}`,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("reversal returned %d: %s", status, raw)
+	}
+	if text(t, reversal, "id") != "jv-1-r" || text(t, reversal, "reversal_of") != "jv-1" {
+		t.Fatalf("reversal head is %v", reversal)
+	}
+	if text(t, reversal, "date") != "2024-03-01" || text(t, reversal, "memo") != "cancel the sale" {
+		t.Fatalf("reversal head is %v", reversal)
+	}
+	if integer(t, reversal, "debit_functional_minor") != 700000 ||
+		integer(t, reversal, "credit_functional_minor") != 700000 {
+		t.Fatalf("reversal functional totals are %v", reversal)
+	}
+	lines := objects(t, reversal, "lines")
+	if len(lines) != 2 {
+		t.Fatalf("reversal lines are %v", lines)
+	}
+	wantSides := []string{"credit", "debit"}
+	wantAccounts := []string{"1200", "4200"}
+	for index, line := range lines {
+		if integer(t, line, "index") != int64(index+1) ||
+			text(t, line, "account_id") != wantAccounts[index] ||
+			text(t, line, "side") != wantSides[index] {
+			t.Fatalf("reversal line %d is %v", index+1, line)
+		}
+		if integer(t, line, "amount_minor") != 100000 ||
+			text(t, line, "currency") != "USD" ||
+			integer(t, line, "rate_numerator") != 7 ||
+			integer(t, line, "rate_denominator") != 1 ||
+			text(t, line, "rate_source") != "snapshot:2024-01-01" ||
+			integer(t, line, "functional_amount_minor") != 700000 ||
+			text(t, line, "reference") != "INV-1" {
+			t.Fatalf("reversal line %d does not mirror the original: %v", index+1, line)
+		}
+	}
+
+	// GET returns the same document and the original is untouched.
+	stored := client.ok("/journals/jv-1-r")
+	if !reflect.DeepEqual(reversal, stored) {
+		t.Fatalf("stored reversal %v differs from the created one %v", stored, reversal)
+	}
+	_, originalAfter, originalDoc := client.get("/journals/jv-1")
+	if originalAfter != originalBefore {
+		t.Fatalf("original journal changed: %s then %s", originalBefore, originalAfter)
+	}
+	if _, found := originalDoc["reversal_of"]; found {
+		t.Fatalf("original journal carries reversal_of: %v", originalDoc)
+	}
+
+	// As-of answers before the reversal date are unchanged; from the reversal
+	// date onwards the pair cancels exactly in both currencies.
+	before := client.ok("/accounts/1200/balance?as_of=2024-02-29")
+	if integer(t, before, "net_minor") != 100000 || integer(t, before, "posting_count") != 1 {
+		t.Fatalf("balance before the reversal changed: %v", before)
+	}
+	after := client.ok("/accounts/1200/balance?as_of=2024-03-01")
+	if integer(t, after, "debit_minor") != 100000 || integer(t, after, "credit_minor") != 100000 ||
+		integer(t, after, "net_minor") != 0 || integer(t, after, "functional_net_minor") != 0 ||
+		integer(t, after, "posting_count") != 2 {
+		t.Fatalf("balance after the reversal is %v", after)
+	}
+	trialAfter := client.ok("/reports/trial-balance?as_of=2024-02-28")
+	if !reflect.DeepEqual(trialBefore, trialAfter) {
+		t.Fatalf("trial balance before the reversal changed: %v then %v", trialBefore, trialAfter)
+	}
+	yearEnd := client.ok("/reports/trial-balance?as_of=2024-12-31")
+	if integer(t, yearEnd, "functional_debit_total_minor") != 0 ||
+		integer(t, yearEnd, "functional_credit_total_minor") != 0 ||
+		text(t, yearEnd, "status") != "balanced" {
+		t.Fatalf("year-end trial balance is %v", yearEnd)
+	}
+
+	// A second journal for the failure cases.
+	client.created("/journals", `{
+		"id":"jv-2","date":"2024-01-20",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":500},
+			{"account_id":"4200","side":"credit","amount_minor":500}
+		]}`)
+
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-9/reversals", key: "rev-404",
+		body: `{"id":"jv-9-r","date":"2024-04-01","memo":"x"}`}, 404, "not_found", "")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-array",
+		body: `[{"id":"jv-2-r"}]`}, 400, "validation_error", "must be a JSON object")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-extra",
+		body: `{"id":"jv-2-r","date":"2024-04-01","memo":"x","note":"y"}`},
+		400, "validation_error", "unknown field")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-noid",
+		body: `{"date":"2024-04-01","memo":"x"}`}, 400, "validation_error", "journal id is required")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-nodate",
+		body: `{"id":"jv-2-r","memo":"x"}`}, 400, "validation_error", "ISO 8601")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-baddate",
+		body: `{"id":"jv-2-r","date":"2024-02-30","memo":"x"}`}, 400, "validation_error", "ISO 8601")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-nomemo",
+		body: `{"id":"jv-2-r","date":"2024-04-01"}`}, 400, "validation_error", "memo is required")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-emptymemo",
+		body: `{"id":"jv-2-r","date":"2024-04-01","memo":""}`}, 400, "validation_error", "memo is required")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-early",
+		body: `{"id":"jv-2-r","date":"2024-01-19","memo":"too early"}`},
+		400, "validation_error", "must not be earlier")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals",
+		body: `{"id":"jv-2-r","date":"2024-04-01","memo":"x"}`}, 400, "validation_error", "Idempotency-Key")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-dup",
+		body: `{"id":"jv-2","date":"2024-04-01","memo":"duplicate id"}`}, 409, "conflict", "already exists")
+
+	// A reversal cannot be dated inside a closed month.
+	client.created("/period-closes", `{"id":"pc-2024-03","period":{"start":"2024-03-01","end":"2024-03-31"}}`)
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-closed",
+		body: `{"id":"jv-2-r","date":"2024-03-15","memo":"closed month"}`},
+		409, "conflict", "closed period rejects journal")
+
+	// April is open, so the reversal posts there.
+	second := client.created("/journals/jv-2/reversals", `{"id":"jv-2-r","date":"2024-04-01","memo":"cancel"}`)
+	if text(t, second, "reversal_of") != "jv-2" {
+		t.Fatalf("second reversal is %v", second)
+	}
+
+	// A journal can be reversed only once, and a reversal cannot be reversed.
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2/reversals", key: "rev-again",
+		body: `{"id":"jv-2-r2","date":"2024-04-02","memo":"again"}`}, 409, "conflict", "already reversed")
+	client.expect(request{method: http.MethodPost, path: "/journals/jv-2-r/reversals", key: "rev-self",
+		body: `{"id":"jv-2-rr","date":"2024-04-02","memo":"reverse the reversal"}`},
+		409, "conflict", "itself a reversal")
+
+	// Idempotent replay returns the first response; the key cannot be reused.
+	client.created("/journals", `{
+		"id":"jv-3","date":"2024-01-25",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":700},
+			{"account_id":"4200","side":"credit","amount_minor":700}
+		]}`)
+	firstStatus, firstRaw, _ := client.send(request{method: http.MethodPost, path: "/journals/jv-3/reversals",
+		key: "rev-replay", body: `{"id":"jv-3-r","date":"2024-04-02","memo":"cancel"}`})
+	secondStatus, secondRaw, _ := client.send(request{method: http.MethodPost, path: "/journals/jv-3/reversals",
+		key: "rev-replay", body: `{"id":"jv-3-r","date":"2024-05-02","memo":"different memo"}`})
+	if firstStatus != http.StatusCreated || secondStatus != http.StatusCreated || firstRaw != secondRaw {
+		t.Fatalf("replay did not return the first response: %d %s then %d %s",
+			firstStatus, firstRaw, secondStatus, secondRaw)
+	}
+	replayed := client.ok("/journals/jv-3-r")
+	if text(t, replayed, "date") != "2024-04-02" || text(t, replayed, "memo") != "cancel" {
+		t.Fatalf("replay stored a second reversal: %v", replayed)
+	}
+	client.expect(request{method: http.MethodPost, path: "/journals", key: "rev-replay", body: `{
+		"id":"jv-4","date":"2024-05-02",
+		"lines":[
+			{"account_id":"1200","side":"debit","amount_minor":1},
+			{"account_id":"4200","side":"credit","amount_minor":1}
+		]}`}, 409, "conflict", "already used for another operation")
+}
+
+func TestJournalReversalSurvivesReopen(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-01-15",
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":4200},
+			{"account_id":"4000","side":"credit","amount_minor":4200}
+		]}`)
+	client.created("/journals/jv-1/reversals", `{"id":"jv-1-r","date":"2024-02-01","memo":"cancel"}`)
+
+	reopened := newClientOn(t, database)
+	stored := reopened.ok("/journals/jv-1-r")
+	if text(t, stored, "reversal_of") != "jv-1" {
+		t.Fatalf("reversal after reopen is %v", stored)
+	}
+	reopened.expect(request{method: http.MethodPost, path: "/journals/jv-1/reversals", key: "rev-late",
+		body: `{"id":"jv-1-r2","date":"2024-02-02","memo":"again"}`}, 409, "conflict", "already reversed")
+	reopened.expect(request{method: http.MethodGet, path: "/journals/jv-1-r2"}, 404, "not_found", "")
+}
+
+func TestJournalReversalAndReconciliation(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":100000,
+		"lines":[{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"}]}`)
+	frozen := client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+	if text(t, frozen, "status") != "balanced" {
+		t.Fatalf("initial reconciliation is %v", frozen)
+	}
+
+	client.created("/journals/jv-1/reversals", `{"id":"jv-1-r","date":"2024-03-20","memo":"cancel"}`)
+
+	// The frozen reconciliation does not change.
+	still := client.ok("/reconciliations/rec-1")
+	if text(t, still, "status") != "balanced" || integer(t, still, "ledger_line_count") != 1 {
+		t.Fatalf("frozen reconciliation changed: %v", still)
+	}
+
+	// A new reconciliation sees the reversal line under the usual rules.
+	fresh := client.created("/reconciliations", `{"id":"rec-2","statement_id":"st-1"}`)
+	if integer(t, fresh, "ledger_line_count") != 2 || integer(t, fresh, "matched_count") != 1 {
+		t.Fatalf("fresh reconciliation is %v", fresh)
+	}
+	if integer(t, fresh, "ledger_net_minor") != 0 || text(t, fresh, "status") != "differences_found" {
+		t.Fatalf("fresh reconciliation is %v", fresh)
+	}
+	summary, ok := fresh["summary"].(map[string]any)
+	if !ok || integer(t, summary, "missing_in_statement") != 1 {
+		t.Fatalf("fresh summary is %v", fresh["summary"])
+	}
+	differences := objects(t, fresh, "differences")
+	if len(differences) != 1 || text(t, differences[0], "ledger_line_id") != "jv-1-r#1" {
+		t.Fatalf("fresh differences are %v", differences)
 	}
 }

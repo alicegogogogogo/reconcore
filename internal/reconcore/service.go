@@ -634,6 +634,100 @@ func (s *Service) GetJournal(id string) (any, error) {
 	})
 }
 
+type createReversalRequest struct {
+	ID   string `json:"id"`
+	Date string `json:"date"`
+	Memo string `json:"memo"`
+}
+
+// CreateReversal posts exactly one reversal journal for the journal named in
+// the path. The reversal mirrors every line of the original with debit and
+// credit swapped, keeps the stored amounts, rate fractions, rate sources and
+// functional amounts, and never resolves a fresh rate, so the pair cancels
+// exactly in both the original and the functional currency. The reversal
+// journal itself is the durable record that the original has been reversed:
+// both are committed in the same atomic state write, so a restart cannot
+// allow a second reversal.
+func (s *Service) CreateReversal(journalID string, body []byte, key string) (any, error) {
+	var request createReversalRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	id, err := validateIdentifier(request.ID, "journal id")
+	if err != nil {
+		return nil, err
+	}
+	date, err := validateDate(request.Date, "date")
+	if err != nil {
+		return nil, err
+	}
+	memo, err := validateText(request.Memo, "memo")
+	if err != nil {
+		return nil, err
+	}
+	if memo == "" {
+		return nil, ValidationError("memo is required")
+	}
+	return s.runIdempotent(key, "create-reversal:"+journalID+":"+id, func(state *State) (any, error) {
+		original, found := state.Journals[journalID]
+		if !found {
+			return nil, NotFoundError("journal %s was not found", journalID)
+		}
+		if date < original.Date {
+			return nil, ValidationError(
+				"date must not be earlier than the date %s of journal %s",
+				original.Date, journalID,
+			)
+		}
+		if original.ReversalOf != "" {
+			return nil, ConflictError("journal %s is itself a reversal and cannot be reversed", journalID)
+		}
+		for _, journal := range state.Journals {
+			if journal.ReversalOf == journalID {
+				return nil, ConflictError("journal %s was already reversed by %s", journalID, journal.ID)
+			}
+		}
+		if _, found := state.Journals[id]; found {
+			return nil, ConflictError("journal %s already exists", id)
+		}
+		if closedPeriodFor(state, date) != nil {
+			return nil, ConflictError("closed period rejects journal")
+		}
+		reversal := &Journal{
+			ID:                    id,
+			Date:                  date,
+			Memo:                  memo,
+			FunctionalCurrency:    original.FunctionalCurrency,
+			Lines:                 make([]*JournalLine, 0, len(original.Lines)),
+			DebitFunctionalMinor:  original.CreditFunctionalMinor,
+			CreditFunctionalMinor: original.DebitFunctionalMinor,
+			CreatedAt:             s.now(),
+			ReversalOf:            journalID,
+		}
+		for _, line := range original.Lines {
+			side := "debit"
+			if line.Side == "debit" {
+				side = "credit"
+			}
+			reversal.Lines = append(reversal.Lines, &JournalLine{
+				Index:                 line.Index,
+				AccountID:             line.AccountID,
+				Side:                  side,
+				AmountMinor:           line.AmountMinor,
+				Currency:              line.Currency,
+				Rate:                  line.Rate,
+				RateNumerator:         line.RateNumerator,
+				RateDenominator:       line.RateDenominator,
+				RateSource:            line.RateSource,
+				FunctionalAmountMinor: line.FunctionalAmountMinor,
+				Reference:             line.Reference,
+			})
+		}
+		state.Journals[id] = reversal
+		return reversal, nil
+	})
+}
+
 type createPeriodCloseRequest struct {
 	ID     string        `json:"id"`
 	Period periodRequest `json:"period"`

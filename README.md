@@ -10,6 +10,7 @@ The initial release intentionally supports a compact public contract:
 
 - every amount is an integer in the currency's minor unit, so no float ever touches money;
 - a journal is stored only when its debit and credit totals agree in the functional currency;
+- a posted journal is cancelled by appending one reversal journal that mirrors it with debit and credit swapped;
 - exchange rates come from dated snapshots, or from an explicit rate on a posting line;
 - `as_of` balances are derived from journal dates, so posting later never changes an earlier answer;
 - `GET /reports/trial-balance` is a read-only as-of report that sums the stored
@@ -84,6 +85,24 @@ from 1 and a ledger line is identified as `"<journal id>#<index>"`. The journal
 is rejected unless `Σ debit functional = Σ credit functional`; both totals are
 returned as `debit_functional_minor` and `credit_functional_minor`. Journals are
 immutable and posting never rewrites history.
+
+**Reversals.** `POST /journals/{id}/reversals` cancels a posted journal by
+appending exactly one new journal whose `reversal_of` names the original. The
+body carries only `id`, `date` and `memo`, all required: `id` follows the
+journal id rules, `date` must not be earlier than the original journal's date
+and must not fall in a closed month, and `memo` is the non-empty reason. Every
+line of the reversal keeps the original's `account_id`, `amount_minor`,
+`currency`, `reference`, resolved rate fraction, `rate_source` and
+`functional_amount_minor` with only `debit` and `credit` swapped, in the
+original line order; no rate is ever re-resolved at the reversal date. The
+reversal's functional debit and credit totals are the original's credit and
+debit totals, so the pair cancels exactly in both the original and the
+functional currency. Balances, the trial balance and the financial statements
+before the reversal date are unchanged and simply include the reversal from
+its date onwards. A journal that is itself a reversal, or one that already has
+a reversal, is rejected with `conflict`, as is a reversal `id` that already
+exists; the reversal and the record that the original has been reversed are
+persisted atomically, so a restart cannot allow a second reversal.
 
 **Balances.** `GET /accounts/{id}/balance?as_of=` sums the lines of that account
 in journals with `date <= as_of` and returns `debit_minor`, `credit_minor`,
@@ -356,6 +375,42 @@ Returns HTTP 201 with the stored journal. Both lines are in USD, so the
 A journal whose functional debits and credits differ returns HTTP 400, for
 example `journal is not balanced in CNY: debits 100000, credits 90000`.
 
+### Reverse a journal
+
+```http
+POST /journals/jv-1/reversals
+Idempotency-Key: reversal-1
+
+{"id":"jv-1-r","date":"2024-02-01","memo":"cancel the consulting invoice"}
+```
+
+Returns HTTP 201 with the stored reversal journal: every line of the original
+appears in the same order with `debit` and `credit` swapped and the stored
+amounts, rate fractions, rate sources and functional amounts carried over
+unchanged, and `reversal_of` names the original journal. `GET /journals/{id}`
+returns the same document; the original journal is never modified.
+
+```json
+{"id":"jv-1-r","date":"2024-02-01","memo":"cancel the consulting invoice",
+ "functional_currency":"CNY","debit_functional_minor":724500,
+ "credit_functional_minor":724500,"created_at":"2024-06-01T12:00:00Z",
+ "reversal_of":"jv-1","lines":[
+   {"index":1,"account_id":"1200","side":"credit","amount_minor":100000,
+    "currency":"USD","rate":"","rate_numerator":1449,"rate_denominator":200,
+    "rate_source":"snapshot:2024-01-01","functional_amount_minor":724500,
+    "reference":"INV-1"},
+   {"index":2,"account_id":"4200","side":"debit","amount_minor":100000,
+    "currency":"USD","rate":"","rate_numerator":1449,"rate_denominator":200,
+    "rate_source":"snapshot:2024-01-01","functional_amount_minor":724500,
+    "reference":"INV-1"}]}
+```
+
+All three body fields are required; a `date` earlier than the original
+journal's date returns HTTP 400. An unknown original returns HTTP 404. A
+reversal `id` that already exists, an original that is itself a reversal, an
+original that was already reversed, or a `date` inside a closed month returns
+HTTP 409 and writes nothing.
+
 ### Close a period
 
 ```http
@@ -457,7 +512,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal dated in a closed period, or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests
