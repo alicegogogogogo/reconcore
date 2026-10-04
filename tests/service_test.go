@@ -1682,3 +1682,272 @@ func TestJournalReversalAndReconciliation(t *testing.T) {
 		t.Fatalf("fresh differences are %v", differences)
 	}
 }
+
+func TestReconciliationResolutions(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/journals", `{
+		"id":"jv-2","date":"2024-03-10",
+		"lines":[
+			{"account_id":"1100","side":"credit","amount_minor":5000,"reference":"FEE-9"},
+			{"account_id":"4000","side":"debit","amount_minor":5000,"reference":"FEE-9"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":87000,
+		"lines":[
+			{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"},
+			{"id":"s2","date":"2024-03-28","amount_minor":-13000,"reference":"FEE-1"}
+		]}`)
+	frozen := client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+	if text(t, frozen, "status") != "differences_found" || len(objects(t, frozen, "differences")) != 2 {
+		t.Fatalf("reconciliation is %v", frozen)
+	}
+
+	// The review starts pending with two open differences.
+	initial := client.ok("/reconciliations/rec-1/resolutions")
+	if len(objects(t, initial, "records")) != 0 {
+		t.Fatalf("initial records are %v", initial["records"])
+	}
+	if integer(t, initial, "difference_count") != 2 || integer(t, initial, "disposed_count") != 0 ||
+		integer(t, initial, "remaining_count") != 2 || text(t, initial, "review_status") != "pending" {
+		t.Fatalf("initial review is %v", initial)
+	}
+
+	// Dispose the first difference; the reason is stored trimmed.
+	status, raw, first := client.send(request{method: http.MethodPost,
+		path: "/reconciliations/rec-1/resolutions", key: "res-key-1",
+		body: `{"id":"res-1","difference_index":1,"disposition":"accepted","reason":"  bank fee confirmed by the bank  "}`})
+	if status != http.StatusCreated {
+		t.Fatalf("first resolution returned %d: %s", status, raw)
+	}
+	if text(t, first, "reconciliation_id") != "rec-1" || text(t, first, "id") != "res-1" {
+		t.Fatalf("first resolution is %v", first)
+	}
+	if integer(t, first, "difference_index") != 1 || text(t, first, "disposition") != "accepted" {
+		t.Fatalf("first resolution is %v", first)
+	}
+	if text(t, first, "reason") != "bank fee confirmed by the bank" {
+		t.Fatalf("reason is %v", first["reason"])
+	}
+	if text(t, first, "created_at") != "2024-06-01T12:00:00Z" {
+		t.Fatalf("created_at is %v", first["created_at"])
+	}
+	snapshot, ok := first["difference"].(map[string]any)
+	if !ok {
+		t.Fatalf("difference snapshot is %v", first["difference"])
+	}
+	if text(t, snapshot, "type") != "missing_in_ledger" || text(t, snapshot, "statement_line_id") != "s2" ||
+		integer(t, snapshot, "difference_minor") != -13000 {
+		t.Fatalf("snapshot is %v", snapshot)
+	}
+
+	// Replaying the same idempotency key returns the first response and does
+	// not count twice.
+	replayStatus, replayed, _ := client.send(request{method: http.MethodPost,
+		path: "/reconciliations/rec-1/resolutions", key: "res-key-1",
+		body: `{"id":"res-1","difference_index":1,"disposition":"accepted","reason":"  bank fee confirmed by the bank  "}`})
+	if replayStatus != http.StatusCreated || replayed != raw {
+		t.Fatalf("replay returned %d: %s, want the first response %s", replayStatus, replayed, raw)
+	}
+	halfway := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, halfway, "disposed_count") != 1 || integer(t, halfway, "remaining_count") != 1 ||
+		text(t, halfway, "review_status") != "pending" {
+		t.Fatalf("halfway review is %v", halfway)
+	}
+	records := objects(t, halfway, "records")
+	if len(records) != 1 || text(t, records[0], "id") != "res-1" {
+		t.Fatalf("halfway records are %v", records)
+	}
+
+	// The frozen reconciliation itself is untouched by the disposition.
+	still := client.ok("/reconciliations/rec-1")
+	if text(t, still, "status") != "differences_found" || len(objects(t, still, "differences")) != 2 ||
+		integer(t, still, "difference_minor") != -8000 {
+		t.Fatalf("frozen reconciliation changed: %v", still)
+	}
+
+	// Dispose the second difference to complete the review.
+	second := client.created("/reconciliations/rec-1/resolutions",
+		`{"id":"res-2","difference_index":2,"disposition":"resolved","reason":"corrected outside the ledger"}`)
+	if text(t, second, "disposition") != "resolved" {
+		t.Fatalf("second resolution is %v", second)
+	}
+	secondSnapshot, _ := second["difference"].(map[string]any)
+	if text(t, secondSnapshot, "type") != "missing_in_statement" || text(t, secondSnapshot, "ledger_line_id") != "jv-2#1" {
+		t.Fatalf("second snapshot is %v", secondSnapshot)
+	}
+	done := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, done, "disposed_count") != 2 || integer(t, done, "remaining_count") != 0 ||
+		text(t, done, "review_status") != "completed" {
+		t.Fatalf("completed review is %v", done)
+	}
+	ordered := objects(t, done, "records")
+	if len(ordered) != 2 || integer(t, ordered[0], "difference_index") != 1 || integer(t, ordered[1], "difference_index") != 2 {
+		t.Fatalf("records are not ordered by difference_index: %v", ordered)
+	}
+
+	// A balanced reconciliation is completed with zero counts.
+	client.created("/statements", `{
+		"id":"st-2","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-04-01","end":"2024-04-30"},
+		"opening_balance_minor":87000,"closing_balance_minor":87000,
+		"lines":[]}`)
+	balanced := client.created("/reconciliations", `{"id":"rec-2","statement_id":"st-2"}`)
+	if text(t, balanced, "status") != "balanced" {
+		t.Fatalf("balanced reconciliation is %v", balanced)
+	}
+	empty := client.ok("/reconciliations/rec-2/resolutions")
+	if len(objects(t, empty, "records")) != 0 || integer(t, empty, "difference_count") != 0 ||
+		integer(t, empty, "disposed_count") != 0 || integer(t, empty, "remaining_count") != 0 ||
+		text(t, empty, "review_status") != "completed" {
+		t.Fatalf("balanced review is %v", empty)
+	}
+}
+
+func TestReconciliationResolutionErrors(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":87000,
+		"lines":[
+			{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"},
+			{"id":"s2","date":"2024-03-28","amount_minor":-13000,"reference":"FEE-1"}
+		]}`)
+	client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+	client.created("/reconciliations/rec-1/resolutions",
+		`{"id":"res-1","difference_index":1,"disposition":"accepted","reason":"kept"}`)
+
+	post := func(key, body string) request {
+		return request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: key, body: body}
+	}
+
+	// Unknown reconciliation ids are not found.
+	client.expect(request{method: http.MethodGet, path: "/reconciliations/rec-9/resolutions"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-9/resolutions", key: "e-404",
+		body: `{"id":"res-9","difference_index":1,"disposition":"accepted","reason":"x"}`}, 404, "not_found", "")
+
+	// Every malformed body is a validation error and writes nothing.
+	client.expect(post("e-1", `{"id":"res-a","difference_index":0,"disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "difference_index")
+	client.expect(post("e-2", `{"id":"res-a","difference_index":-2,"disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "difference_index")
+	client.expect(post("e-3", `{"id":"res-a","difference_index":2,"disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "out of range")
+	client.expect(post("e-4", `{"id":"res-a","difference_index":1.5,"disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "")
+	client.expect(post("e-5", `{"id":"res-a","difference_index":"1","disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "")
+	client.expect(post("e-6", `{"id":"res-a","difference_index":1,"disposition":"ignored","reason":"x"}`),
+		400, "validation_error", "disposition")
+	client.expect(post("e-7", `{"id":"res-a","difference_index":1,"disposition":"accepted","reason":"   "}`),
+		400, "validation_error", "reason")
+	client.expect(post("e-8", `{"id":"res-a","difference_index":1,"disposition":"accepted","reason":"x","note":"y"}`),
+		400, "validation_error", "")
+	client.expect(post("e-9", `{"id":"res a","difference_index":1,"disposition":"accepted","reason":"x"}`),
+		400, "validation_error", "resolution id")
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions",
+		body: `{"id":"res-b","difference_index":1,"disposition":"accepted","reason":"x"}`},
+		400, "validation_error", "Idempotency-Key")
+
+	// The stored resolution, the disposed difference and a reused key conflict.
+	client.expect(post("e-10", `{"id":"res-1","difference_index":1,"disposition":"resolved","reason":"again"}`),
+		409, "conflict", "already exists")
+	client.expect(post("e-11", `{"id":"res-2","difference_index":1,"disposition":"resolved","reason":"again"}`),
+		409, "conflict", "already has resolution")
+	client.created("/accounts", accountBody("1200", "Savings", "asset", "CNY"))
+	client.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "key-005",
+		body: `{"id":"res-3","difference_index":1,"disposition":"accepted","reason":"x"}`},
+		409, "conflict", "another operation")
+
+	// The failed writes changed nothing.
+	review := client.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, review, "disposed_count") != 1 || integer(t, review, "remaining_count") != 0 {
+		t.Fatalf("failed writes changed the review: %v", review)
+	}
+
+	// The list endpoint accepts no query parameters.
+	client.expect(request{method: http.MethodGet, path: "/reconciliations/rec-1/resolutions?review_status=pending"},
+		400, "validation_error", "unknown query parameter")
+}
+
+func TestReconciliationResolutionsSurviveReopen(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", `{
+		"id":"jv-1","date":"2024-03-05",
+		"lines":[
+			{"account_id":"1100","side":"debit","amount_minor":100000,"reference":"INV-1"},
+			{"account_id":"4000","side":"credit","amount_minor":100000,"reference":"INV-1"}
+		]}`)
+	client.created("/statements", `{
+		"id":"st-1","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":0,"closing_balance_minor":87000,
+		"lines":[
+			{"id":"s1","date":"2024-03-05","amount_minor":100000,"reference":"INV-1"},
+			{"id":"s2","date":"2024-03-28","amount_minor":-13000,"reference":"FEE-1"}
+		]}`)
+	client.created("/reconciliations", `{"id":"rec-1","statement_id":"st-1"}`)
+	client.created("/reconciliations/rec-1/resolutions",
+		`{"id":"res-1","difference_index":1,"disposition":"resolved","reason":"fee reversed by the bank"}`)
+
+	reopened := newClientOn(t, database)
+	review := reopened.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, review, "disposed_count") != 1 || text(t, review, "review_status") != "completed" {
+		t.Fatalf("review after reopen is %v", review)
+	}
+	records := objects(t, review, "records")
+	if len(records) != 1 || text(t, records[0], "reason") != "fee reversed by the bank" {
+		t.Fatalf("records after reopen are %v", records)
+	}
+	snapshot, _ := records[0]["difference"].(map[string]any)
+	if text(t, snapshot, "type") != "missing_in_ledger" || integer(t, snapshot, "difference_minor") != -13000 {
+		t.Fatalf("snapshot after reopen is %v", snapshot)
+	}
+
+	// Later journals and reconciliations never touch the stored resolution.
+	// The reopened client uses fresh idempotency keys because the database
+	// already remembers the keys of the first client.
+	reopened.keys = 1000
+	reopened.created("/journals", `{
+		"id":"jv-2","date":"2024-03-28",
+		"lines":[
+			{"account_id":"1100","side":"credit","amount_minor":13000,"reference":"FEE-1"},
+			{"account_id":"4000","side":"debit","amount_minor":13000,"reference":"FEE-1"}
+		]}`)
+	reopened.created("/reconciliations", `{"id":"rec-2","statement_id":"st-1"}`)
+	after := reopened.ok("/reconciliations/rec-1/resolutions")
+	if integer(t, after, "disposed_count") != 1 || text(t, after, "review_status") != "completed" {
+		t.Fatalf("review changed after new activity: %v", after)
+	}
+	unchanged := objects(t, after, "records")
+	unchangedSnapshot, _ := unchanged[0]["difference"].(map[string]any)
+	if text(t, unchangedSnapshot, "type") != "missing_in_ledger" ||
+		integer(t, unchangedSnapshot, "difference_minor") != -13000 {
+		t.Fatalf("snapshot changed after new activity: %v", unchangedSnapshot)
+	}
+	// The disposed difference still rejects a second resolution.
+	reopened.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "late-1",
+		body: `{"id":"res-2","difference_index":1,"disposition":"accepted","reason":"second"}`},
+		409, "conflict", "already has resolution")
+}

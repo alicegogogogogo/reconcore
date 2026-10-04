@@ -3,6 +3,7 @@ package reconcore
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -1148,6 +1149,112 @@ func (s *Service) GetReconciliation(id string) (any, error) {
 			return nil, NotFoundError("reconciliation %s was not found", id)
 		}
 		return reconciliation, nil
+	})
+}
+
+type createResolutionRequest struct {
+	ID              string `json:"id"`
+	DifferenceIndex int    `json:"difference_index"`
+	Disposition     string `json:"disposition"`
+	Reason          string `json:"reason"`
+}
+
+// CreateResolution stores the immutable human disposition of one frozen
+// difference of one reconciliation. The difference is deep-copied into the
+// resolution at write time, so the snapshot survives later journals,
+// statements and reconciliations unchanged. A resolution can never be updated
+// or deleted: the same difference accepts exactly one resolution and a
+// resolution id is unique across the whole ledger.
+func (s *Service) CreateResolution(reconciliationID string, body []byte, key string) (any, error) {
+	var request createResolutionRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	id, err := validateIdentifier(request.ID, "resolution id")
+	if err != nil {
+		return nil, err
+	}
+	if request.DifferenceIndex < 1 {
+		return nil, ValidationError("difference_index must be a positive integer starting at 1")
+	}
+	if request.Disposition != "accepted" && request.Disposition != "resolved" {
+		return nil, ValidationError("disposition must be accepted or resolved")
+	}
+	reason := strings.TrimSpace(request.Reason)
+	if reason == "" {
+		return nil, ValidationError("reason must not be blank")
+	}
+	if _, err := validateText(reason, "reason"); err != nil {
+		return nil, err
+	}
+	return s.runIdempotent(key, "create-resolution:"+reconciliationID+":"+id, func(state *State) (any, error) {
+		reconciliation, found := state.Reconciliations[reconciliationID]
+		if !found {
+			return nil, NotFoundError("reconciliation %s was not found", reconciliationID)
+		}
+		if request.DifferenceIndex > len(reconciliation.Differences) {
+			return nil, ValidationError(
+				"difference_index %d is out of range: reconciliation %s has %d differences",
+				request.DifferenceIndex, reconciliationID, len(reconciliation.Differences),
+			)
+		}
+		if _, found := state.Resolutions[id]; found {
+			return nil, ConflictError("resolution %s already exists", id)
+		}
+		for _, existing := range state.Resolutions {
+			if existing.ReconciliationID == reconciliationID && existing.DifferenceIndex == request.DifferenceIndex {
+				return nil, ConflictError(
+					"difference %d of reconciliation %s already has resolution %s",
+					request.DifferenceIndex, reconciliationID, existing.ID,
+				)
+			}
+		}
+		resolution := &Resolution{
+			ID:               id,
+			ReconciliationID: reconciliationID,
+			DifferenceIndex:  request.DifferenceIndex,
+			Disposition:      request.Disposition,
+			Reason:           reason,
+			Difference:       cloneDifference(reconciliation.Differences[request.DifferenceIndex-1]),
+			CreatedAt:        s.now(),
+		}
+		state.Resolutions[id] = resolution
+		return resolution, nil
+	})
+}
+
+// ListResolutions returns every stored resolution of one reconciliation
+// ordered by difference index, together with the review counts derived from
+// the frozen differences. It never writes state.
+func (s *Service) ListResolutions(reconciliationID string) (any, error) {
+	return s.store.View(func(state *State) (any, error) {
+		reconciliation, found := state.Reconciliations[reconciliationID]
+		if !found {
+			return nil, NotFoundError("reconciliation %s was not found", reconciliationID)
+		}
+		records := []*Resolution{}
+		for _, resolution := range state.Resolutions {
+			if resolution.ReconciliationID == reconciliationID {
+				records = append(records, resolution)
+			}
+		}
+		sort.Slice(records, func(left, right int) bool {
+			return records[left].DifferenceIndex < records[right].DifferenceIndex
+		})
+		differenceCount := len(reconciliation.Differences)
+		remaining := differenceCount - len(records)
+		status := "pending"
+		if remaining <= 0 {
+			status = "completed"
+		}
+		return &ResolutionList{
+			ReconciliationID: reconciliationID,
+			Records:          records,
+			DifferenceCount:  differenceCount,
+			DisposedCount:    len(records),
+			RemainingCount:   remaining,
+			ReviewStatus:     status,
+		}, nil
 	})
 }
 

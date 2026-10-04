@@ -19,6 +19,7 @@ The initial release intentionally supports a compact public contract:
   builds a balance sheet at `as_of` and an income statement over a closed
   period, reuses the stored functional amounts and never writes state;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
+- each frozen difference accepts at most one immutable resolution (`accepted` or `resolved` with a non-blank reason), which keeps a snapshot of the difference it disposes;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -500,6 +501,68 @@ Returns HTTP 201 with the frozen result:
 `GET /reconciliations/{id}` returns the stored reconciliation unchanged, even
 after more journals are posted; create a new reconciliation to refresh it.
 
+### Resolve a reconciliation difference
+
+```http
+POST /reconciliations/rec-1/resolutions
+Idempotency-Key: resolution-1
+
+{"id":"res-1","difference_index":1,"disposition":"accepted","reason":"bank fee confirmed by the bank"}
+```
+
+Records the immutable human disposition of one frozen difference.
+`difference_index` is the 1-based position of the difference in the stored
+reconciliation's `differences` array. `disposition` is `accepted` (the
+difference is reasonable and stays) or `resolved` (the difference was handled
+outside the system). `reason` must be non-blank after trimming surrounding
+whitespace and is stored trimmed. Returns HTTP 201 with the stored resolution,
+including a deep snapshot of the original difference:
+
+```json
+{"id":"res-1","reconciliation_id":"rec-1","difference_index":1,
+ "disposition":"accepted","reason":"bank fee confirmed by the bank",
+ "difference":{"type":"missing_in_ledger",
+   "detail":"the statement line has no journal line in the period",
+   "statement_line_id":"s2","statement_date":"2024-01-28",
+   "statement_amount_minor":-13000,"difference_minor":-13000},
+ "created_at":"2024-06-01T12:00:00Z"}
+```
+
+Each difference accepts exactly one resolution and each resolution `id` is
+unique; a resolution can never be updated or deleted, and its difference
+snapshot survives restarts, later journals and new reconciliations unchanged.
+An unknown reconciliation returns HTTP 404; a non-positive or out-of-range
+`difference_index`, an unsupported `disposition`, a blank `reason` or an
+unknown body field returns HTTP 400; a duplicate resolution `id` or an
+already-disposed difference returns HTTP 409.
+
+### Inspect the review of a reconciliation
+
+```http
+GET /reconciliations/rec-1/resolutions
+```
+
+Returns every stored resolution ordered by `difference_index`, plus the review
+counts derived from the frozen differences. The endpoint accepts no query
+parameters.
+
+```json
+{"reconciliation_id":"rec-1","records":[
+  {"id":"res-1","reconciliation_id":"rec-1","difference_index":1,
+   "disposition":"accepted","reason":"bank fee confirmed by the bank",
+   "difference":{"type":"missing_in_ledger",
+     "detail":"the statement line has no journal line in the period",
+     "statement_line_id":"s2","statement_date":"2024-01-28",
+     "statement_amount_minor":-13000,"difference_minor":-13000},
+   "created_at":"2024-06-01T12:00:00Z"}],
+ "difference_count":1,"disposed_count":1,"remaining_count":0,
+ "review_status":"completed"}
+```
+
+`review_status` is `completed` when every frozen difference has a resolution,
+otherwise `pending`; a `balanced` reconciliation with no differences returns
+empty `records`, zero counts and `completed`.
+
 ## Errors
 
 Errors use this shape:
@@ -512,7 +575,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests

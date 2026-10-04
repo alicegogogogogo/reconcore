@@ -187,6 +187,47 @@ type Reconciliation struct {
 	CreatedAt          string            `json:"created_at"`
 }
 
+// Resolution is the immutable human disposition of one frozen difference of
+// one reconciliation. Difference is a deep snapshot of the original difference
+// taken when the resolution was stored, so later journals, statements or
+// reconciliations can never change what was reviewed.
+type Resolution struct {
+	ID               string      `json:"id"`
+	ReconciliationID string      `json:"reconciliation_id"`
+	DifferenceIndex  int         `json:"difference_index"`
+	Disposition      string      `json:"disposition"`
+	Reason           string      `json:"reason"`
+	Difference       *Difference `json:"difference"`
+	CreatedAt        string      `json:"created_at"`
+}
+
+// ResolutionList is the review status of one reconciliation: every stored
+// resolution ordered by difference index plus the counts derived from the
+// frozen differences.
+type ResolutionList struct {
+	ReconciliationID string        `json:"reconciliation_id"`
+	Records          []*Resolution `json:"records"`
+	DifferenceCount  int           `json:"difference_count"`
+	DisposedCount    int           `json:"disposed_count"`
+	RemainingCount   int           `json:"remaining_count"`
+	ReviewStatus     string        `json:"review_status"`
+}
+
+// cloneDifference deep-copies a difference so a resolution snapshot can never
+// be mutated through the reconciliation it came from.
+func cloneDifference(difference *Difference) *Difference {
+	snapshot := *difference
+	if difference.StatementAmountMinor != nil {
+		amount := *difference.StatementAmountMinor
+		snapshot.StatementAmountMinor = &amount
+	}
+	if difference.LedgerAmountMinor != nil {
+		amount := *difference.LedgerAmountMinor
+		snapshot.LedgerAmountMinor = &amount
+	}
+	return &snapshot
+}
+
 // Balance is the derived position of one account at one date.
 type Balance struct {
 	AccountID             string `json:"account_id"`

@@ -16,6 +16,7 @@ type State struct {
 	Rates           []*Rate                       `json:"rates"`
 	Statements      map[string]*Statement         `json:"statements"`
 	Reconciliations map[string]*Reconciliation    `json:"reconciliations"`
+	Resolutions     map[string]*Resolution        `json:"resolutions"`
 	PeriodCloses    map[string]*PeriodClose       `json:"period_closes"`
 	Idempotency     map[string]*IdempotencyRecord `json:"idempotency"`
 }
@@ -27,6 +28,7 @@ func newState() *State {
 		Rates:           []*Rate{},
 		Statements:      map[string]*Statement{},
 		Reconciliations: map[string]*Reconciliation{},
+		Resolutions:     map[string]*Resolution{},
 		PeriodCloses:    map[string]*PeriodClose{},
 		Idempotency:     map[string]*IdempotencyRecord{},
 	}
@@ -76,6 +78,9 @@ func (s *State) repair() {
 	}
 	if s.Reconciliations == nil {
 		s.Reconciliations = map[string]*Reconciliation{}
+	}
+	if s.Resolutions == nil {
+		s.Resolutions = map[string]*Resolution{}
 	}
 	if s.PeriodCloses == nil {
 		s.PeriodCloses = map[string]*PeriodClose{}
