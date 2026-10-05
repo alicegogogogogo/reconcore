@@ -1349,6 +1349,100 @@ func (s *Service) ListResolutions(reconciliationID string) (any, error) {
 	})
 }
 
+type createReconciliationReportRequest struct {
+	ID               string `json:"id"`
+	ReconciliationID string `json:"reconciliation_id"`
+}
+
+// CreateReconciliationReport publishes the independently retained final
+// report of one fully reviewed reconciliation. The reconciliation snapshot and
+// every disposition snapshot are frozen into the report together with the
+// idempotency record in one atomic state write, so later activity can never
+// change the published document and a restart cannot publish it twice.
+func (s *Service) CreateReconciliationReport(body []byte, key string) (any, error) {
+	var request createReconciliationReportRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	id, err := validateIdentifier(request.ID, "report id")
+	if err != nil {
+		return nil, err
+	}
+	reconciliationID, err := validateIdentifier(request.ReconciliationID, "reconciliation_id")
+	if err != nil {
+		return nil, err
+	}
+	return s.runIdempotent(key, "create-reconciliation-report:"+id, func(state *State) (any, error) {
+		if _, found := state.ReconciliationReports[id]; found {
+			return nil, ConflictError("reconciliation report %s already exists", id)
+		}
+		reconciliation, found := state.Reconciliations[reconciliationID]
+		if !found {
+			return nil, NotFoundError("reconciliation %s was not found", reconciliationID)
+		}
+		resolutions := []*Resolution{}
+		for _, resolution := range state.Resolutions {
+			if resolution.ReconciliationID == reconciliationID {
+				resolutions = append(resolutions, resolution)
+			}
+		}
+		sort.Slice(resolutions, func(left, right int) bool {
+			return resolutions[left].DifferenceIndex < resolutions[right].DifferenceIndex
+		})
+		if len(resolutions) != len(reconciliation.Differences) {
+			return nil, ConflictError(
+				"reconciliation %s has %d undisposed differences and cannot be reported yet",
+				reconciliationID, len(reconciliation.Differences)-len(resolutions),
+			)
+		}
+		for _, existing := range state.ReconciliationReports {
+			if existing.ReconciliationID == reconciliationID {
+				return nil, ConflictError(
+					"reconciliation %s already has report %s", reconciliationID, existing.ID,
+				)
+			}
+		}
+		summary := DispositionSummary{TotalCount: len(resolutions)}
+		snapshots := make([]*Resolution, 0, len(resolutions))
+		for _, resolution := range resolutions {
+			snapshots = append(snapshots, copyResolution(resolution))
+			switch resolution.Disposition {
+			case "accepted":
+				summary.AcceptedCount++
+			case "resolved":
+				summary.ResolvedCount++
+			default:
+				return nil, InternalError(
+					"resolution %s carries the unknown disposition %s", resolution.ID, resolution.Disposition,
+				)
+			}
+		}
+		report := &ReconciliationReport{
+			ID:                 id,
+			ReconciliationID:   reconciliationID,
+			GeneratedAt:        s.now(),
+			ReviewStatus:       "completed",
+			Reconciliation:     copyReconciliation(reconciliation),
+			Resolutions:        snapshots,
+			DispositionSummary: summary,
+		}
+		state.ReconciliationReports[id] = report
+		return report, nil
+	})
+}
+
+// GetReconciliationReport returns exactly the document published at creation
+// time; its snapshots and summary never change afterwards.
+func (s *Service) GetReconciliationReport(id string) (any, error) {
+	return s.store.View(func(state *State) (any, error) {
+		report, found := state.ReconciliationReports[id]
+		if !found {
+			return nil, NotFoundError("reconciliation report %s was not found", id)
+		}
+		return report, nil
+	})
+}
+
 // ledgerEntry is one journal line seen from the ledger side of a
 // reconciliation. AmountMinor is signed with debits positive.
 type ledgerEntry struct {

@@ -185,6 +185,21 @@ func (s *Server) dispatch(request *http.Request, parts []string) (int, any, erro
 		response, err := s.service.ListResolutions(parts[1])
 		return http.StatusOK, response, err
 
+	case method == http.MethodPost && len(parts) == 1 && parts[0] == "reconciliation-reports":
+		body, err := readJSONBody(request)
+		if err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.CreateReconciliationReport(body, request.Header.Get("Idempotency-Key"))
+		return http.StatusCreated, response, err
+
+	case method == http.MethodGet && len(parts) == 2 && parts[0] == "reconciliation-reports":
+		if err := requireQuery(request); err != nil {
+			return 0, nil, err
+		}
+		response, err := s.service.GetReconciliationReport(parts[1])
+		return http.StatusOK, response, err
+
 	case method == http.MethodPost && len(parts) == 1 && parts[0] == "period-closes":
 		body, err := readJSONBody(request)
 		if err != nil {

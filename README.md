@@ -19,6 +19,7 @@ The initial release intentionally supports a compact public contract:
   builds a balance sheet at `as_of` and an income statement over a closed
   period, reuses the stored functional amounts and never writes state;
 - every reconciliation difference is `timing`, `amount_mismatch`, `missing_in_ledger` or `missing_in_statement`;
+- a completed review can be published once as an independent, immutable reconciliation report;
 - duplicate commands with the same idempotency key return the original result.
 
 ## Requirements
@@ -205,6 +206,27 @@ what was reviewed. `GET /reconciliations/{id}/resolutions` lists the
 resolutions ordered by `difference_index` together with `difference_count`,
 `disposed_count`, `remaining_count` and a `review_status` that is `completed`
 once every frozen difference is disposed and `pending` otherwise.
+
+**Reconciliation reports.** `POST /reconciliation-reports` publishes the
+final, independently retained report of one fully reviewed reconciliation.
+The body carries only `id` and `reconciliation_id` and requires an
+`Idempotency-Key`. A report can be published only when the reconciliation's
+`review_status` is `completed`, meaning every frozen difference has a
+disposition; a balanced reconciliation without differences is already
+completed and can be reported. Publishing freezes a complete deep snapshot of
+the reconciliation, every disposition snapshot ordered by
+`difference_index` and a `disposition_summary` with fixed `accepted_count`,
+`resolved_count` and `total_count` — the first two count the two dispositions
+and `total_count` equals both the disposition count and the frozen difference
+count, so all three are zero for a balanced reconciliation. The report
+carries `generated_at` and `review_status` `completed`. It is stored once,
+atomically together with its idempotency record, and can never be updated or
+deleted: later vouchers, statements, reconciliations or resolutions never
+change its snapshots or summary, and `GET /reconciliation-reports/{id}`
+returns the same document after a restart. A report id already in use, or a
+second report for the same reconciliation, returns `conflict`; publishing
+against an unknown reconciliation returns `not_found`; publishing while
+differences remain undisposed returns `conflict`.
 
 ## HTTP API
 
@@ -614,6 +636,72 @@ returns the review progress:
 frozen differences. A balanced reconciliation returns empty `records`, zero
 counts and `review_status` `completed`.
 
+### Publish a reconciliation report
+
+```http
+POST /reconciliation-reports
+Idempotency-Key: report-1
+
+{"id":"rpt-1","reconciliation_id":"rec-1"}
+```
+
+Returns HTTP 201 with the stored report. `generated_at` is stamped at
+publication and `review_status` is `completed`. `reconciliation` is the exact
+frozen reconciliation document, `resolutions` holds every stored disposition
+(with its own frozen difference snapshot) sorted by `difference_index`, and
+`disposition_summary` counts them:
+
+```json
+{"id":"rpt-1","reconciliation_id":"rec-1",
+ "generated_at":"2024-06-01T12:00:00Z","review_status":"completed",
+ "reconciliation":{
+   "id":"rec-1","statement_id":"st-1","account_id":"1200","currency":"USD",
+   "functional_currency":"CNY","period":{"start":"2024-01-01","end":"2024-01-31"},
+   "status":"differences_found","matched_count":1,"statement_line_count":2,
+   "ledger_line_count":1,"statement_net_minor":87000,"ledger_net_minor":100000,
+   "difference_minor":-13000,
+   "summary":{"timing":0,"amount_mismatch":0,"missing_in_ledger":1,
+               "missing_in_statement":0},
+   "differences":[{"type":"missing_in_ledger",
+     "detail":"the statement line has no journal line in the period",
+     "statement_line_id":"s2","statement_date":"2024-01-28",
+     "statement_amount_minor":-13000,"difference_minor":-13000}],
+   "created_at":"2024-06-01T12:00:00Z"},
+ "resolutions":[
+   {"id":"res-1","reconciliation_id":"rec-1","difference_index":1,
+    "disposition":"resolved","reason":"fee was refunded outside the ledger",
+    "difference":{"type":"missing_in_ledger",
+      "detail":"the statement line has no journal line in the period",
+      "statement_line_id":"s2","statement_date":"2024-01-28",
+      "statement_amount_minor":-13000,"difference_minor":-13000},
+    "created_at":"2024-06-01T12:00:00Z"}],
+ "disposition_summary":{"accepted_count":0,"resolved_count":1,"total_count":1}}
+```
+
+Publishing requires a completed review: every frozen difference must already
+hold one disposition, so an unfinished reconciliation returns HTTP 409 with
+`conflict`. An unknown `reconciliation_id` returns HTTP 404 with `not_found`.
+A reused report id or a second report for the same reconciliation returns
+HTTP 409 with `conflict`. A balanced reconciliation with no differences is
+`completed` on its own and publishes with an empty `resolutions` array and
+all three disposition counts zero. The body must contain exactly `id` and
+`reconciliation_id`; a non-object body, an unknown field, an invalid
+identifier, or a missing `Idempotency-Key` returns HTTP 400 with
+`validation_error`. The report, both snapshots and the idempotency record are
+committed in one atomic write.
+
+```http
+GET /reconciliation-reports/rpt-1
+```
+
+returns exactly the document created above, accepts no query parameters
+(any parameter returns HTTP 400 with `validation_error`) and answers HTTP 404
+with `not_found` for an unknown report. The report is immutable: there is no
+update or delete entry point, new vouchers, statements, reconciliations and
+resolutions never alter the snapshots or the summary, and replaying the same
+`Idempotency-Key` after a restart returns the original 201 document without
+creating a second report.
+
 ## Errors
 
 Errors use this shape:
@@ -626,7 +714,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, a reconciliation published twice or before its review is completed, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests

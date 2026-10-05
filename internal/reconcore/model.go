@@ -212,6 +212,33 @@ type Resolution struct {
 	CreatedAt        string      `json:"created_at"`
 }
 
+// DispositionSummary counts the immutable dispositions frozen into a
+// reconciliation report. AcceptedCount and ResolvedCount partition the
+// resolutions, while TotalCount is both the number of dispositions and the
+// number of frozen differences of the reported reconciliation; for a balanced
+// reconciliation with no differences all three counts are zero.
+type DispositionSummary struct {
+	AcceptedCount int `json:"accepted_count"`
+	ResolvedCount int `json:"resolved_count"`
+	TotalCount    int `json:"total_count"`
+}
+
+// ReconciliationReport is the independently retained final report of a fully
+// reviewed reconciliation. Reconciliation is a complete deep snapshot of the
+// frozen result and Resolutions holds every disposition snapshot ordered by
+// difference_index. The document can never change after publication: new
+// vouchers, statements, reconciliations or resolutions do not touch it, and it
+// survives restarts byte for byte. A report can never be updated or deleted.
+type ReconciliationReport struct {
+	ID                 string             `json:"id"`
+	ReconciliationID   string             `json:"reconciliation_id"`
+	GeneratedAt        string             `json:"generated_at"`
+	ReviewStatus       string             `json:"review_status"`
+	Reconciliation     *Reconciliation    `json:"reconciliation"`
+	Resolutions        []*Resolution      `json:"resolutions"`
+	DispositionSummary DispositionSummary `json:"disposition_summary"`
+}
+
 // copyDifference deep-copies one frozen difference so a resolution snapshot
 // shares no memory with the reconciliation it was taken from.
 func copyDifference(difference *Difference) *Difference {
@@ -223,6 +250,27 @@ func copyDifference(difference *Difference) *Difference {
 	if difference.LedgerAmountMinor != nil {
 		amount := *difference.LedgerAmountMinor
 		copied.LedgerAmountMinor = &amount
+	}
+	return &copied
+}
+
+// copyResolution deep-copies one stored disposition, including the frozen
+// difference snapshot embedded in it.
+func copyResolution(resolution *Resolution) *Resolution {
+	copied := *resolution
+	copied.Difference = copyDifference(resolution.Difference)
+	return &copied
+}
+
+// copyReconciliation deep-copies a frozen reconciliation so a report snapshot
+// shares no memory with the stored reconciliation it was taken from.
+func copyReconciliation(reconciliation *Reconciliation) *Reconciliation {
+	copied := *reconciliation
+	copied.Period = reconciliation.Period
+	copied.Summary = reconciliation.Summary
+	copied.Differences = make([]*Difference, 0, len(reconciliation.Differences))
+	for _, difference := range reconciliation.Differences {
+		copied.Differences = append(copied.Differences, copyDifference(difference))
 	}
 	return &copied
 }
