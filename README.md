@@ -86,6 +86,14 @@ is rejected unless `Σ debit functional = Σ credit functional`; both totals are
 returned as `debit_functional_minor` and `credit_functional_minor`. Journals are
 immutable and posting never rewrites history.
 
+**Journal batches.** `POST /journal-batches` imports one to one hundred
+ordinary journals atomically: the body carries a batch `id` (journal id rules)
+and a `journals` array in request order, each entry following the ordinary
+journal shape. The batch commits every journal, the batch record and the
+idempotency record in one write or none at all, and the stored batch document
+(`id`, `journal_count`, `journal_ids` in request order, `created_at`) is
+readable through `GET /journal-batches/{id}` and never changes afterwards.
+
 **Reversals.** `POST /journals/{id}/reversals` cancels a posted journal by
 appending exactly one new journal whose `reversal_of` names the original. The
 body carries only `id`, `date` and `memo`, all required: `id` follows the
@@ -389,6 +397,52 @@ Returns HTTP 201 with the stored journal. Both lines are in USD, so the
 A journal whose functional debits and credits differ returns HTTP 400, for
 example `journal is not balanced in CNY: debits 100000, credits 90000`.
 
+### Import a batch of journals
+
+```http
+POST /journal-batches
+Idempotency-Key: batch-1
+
+{"id":"batch-1","journals":[
+  {"id":"jv-2","date":"2024-01-16",
+   "lines":[
+     {"account_id":"1200","side":"debit","amount_minor":50000},
+     {"account_id":"4200","side":"credit","amount_minor":50000}
+   ]},
+  {"id":"jv-3","date":"2024-01-17",
+   "lines":[
+     {"account_id":"1200","side":"debit","amount_minor":70000},
+     {"account_id":"4200","side":"credit","amount_minor":70000}
+   ]}
+ ]}
+```
+
+Imports one to one hundred ordinary journals as a single atomic commit. The
+`id` follows the journal id rules, `journals` keeps request order and every
+entry follows the `POST /journals` request shape and validation; unknown
+fields on the batch or on any journal are rejected. Returns HTTP 201 with the
+batch document: `id`, `journal_count`, `journal_ids` in request order and
+`created_at`. Each journal is stored exactly as if it had been posted on its
+own and is readable through `GET /journals/{id}`.
+
+```json
+{"id":"batch-1","journal_count":2,"journal_ids":["jv-2","jv-3"],
+ "created_at":"2024-06-01T12:00:00Z"}
+```
+
+`GET /journal-batches/{id}` returns the same document and accepts no query
+parameters; an unknown id returns HTTP 404. The batch record and its journal
+order survive restarts and are never rewritten by later activity.
+
+A malformed batch envelope (non-object body, missing or invalid `id`, missing
+or mistyped `journals`, fewer than one or more than one hundred entries) or
+any journal that would fail `POST /journals` validation returns HTTP 400. A
+journal `id` that already exists, a duplicate journal id inside the batch, a
+batch `id` that already exists, or a journal dated inside a closed month
+returns HTTP 409. Every failure is atomic: no batch record, journal or
+idempotency record is written unless the whole batch commits. Replaying the
+same `Idempotency-Key` returns the first 201 response without writing again.
+
 ### Reverse a journal
 
 ```http
@@ -568,7 +622,7 @@ Errors use this shape:
 | --- | --- | --- |
 | `validation_error` | 400 | the body or a parameter violates the contract, or the idempotency key is missing |
 | `not_found` | 404 | unknown route or unknown id |
-| `conflict` | 409 | duplicate id, duplicate rate snapshot, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, or an idempotency key reused for another operation |
+| `conflict` | 409 | duplicate id, duplicate rate snapshot, a duplicate journal id inside a batch, a journal or reversal dated in a closed period, a journal that cannot be reversed (again), a difference that already has a resolution, or an idempotency key reused for another operation |
 | `internal_error` | 500 | an internal invariant, such as the reconciliation completeness check, failed |
 
 ## Tests

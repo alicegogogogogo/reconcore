@@ -13,6 +13,7 @@ import (
 type State struct {
 	Accounts        map[string]*Account           `json:"accounts"`
 	Journals        map[string]*Journal           `json:"journals"`
+	JournalBatches  map[string]*JournalBatch      `json:"journal_batches"`
 	Rates           []*Rate                       `json:"rates"`
 	Statements      map[string]*Statement         `json:"statements"`
 	Reconciliations map[string]*Reconciliation    `json:"reconciliations"`
@@ -25,6 +26,7 @@ func newState() *State {
 	return &State{
 		Accounts:        map[string]*Account{},
 		Journals:        map[string]*Journal{},
+		JournalBatches:  map[string]*JournalBatch{},
 		Rates:           []*Rate{},
 		Statements:      map[string]*Statement{},
 		Reconciliations: map[string]*Reconciliation{},
@@ -69,6 +71,9 @@ func (s *State) repair() {
 	}
 	if s.Journals == nil {
 		s.Journals = map[string]*Journal{}
+	}
+	if s.JournalBatches == nil {
+		s.JournalBatches = map[string]*JournalBatch{}
 	}
 	if s.Rates == nil {
 		s.Rates = []*Rate{}

@@ -22,6 +22,7 @@ const (
 	maxTextLength       = 256
 	maxRateDigits       = 18
 	maxRateDecimals     = 9
+	maxBatchJournals    = 100
 )
 
 // normalBalanceByType maps an account type onto the side that increases it.
@@ -102,6 +103,16 @@ type Journal struct {
 	CreditFunctionalMinor int64          `json:"credit_functional_minor"`
 	CreatedAt             string         `json:"created_at"`
 	ReversalOf            string         `json:"reversal_of,omitempty"`
+}
+
+// JournalBatch is the immutable record of one atomic bulk import. JournalIDs
+// keeps the request order of the journals committed with the batch; later
+// ledger activity never rewrites it.
+type JournalBatch struct {
+	ID           string   `json:"id"`
+	JournalCount int      `json:"journal_count"`
+	JournalIDs   []string `json:"journal_ids"`
+	CreatedAt    string   `json:"created_at"`
 }
 
 // Period is an inclusive date window.
