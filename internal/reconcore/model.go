@@ -212,6 +212,30 @@ type Resolution struct {
 	CreatedAt        string      `json:"created_at"`
 }
 
+// DispositionSummary counts the resolutions frozen into one published
+// reconciliation report by disposition. TotalCount always equals the number
+// of resolution snapshots and the number of frozen differences.
+type DispositionSummary struct {
+	AcceptedCount int `json:"accepted_count"`
+	ResolvedCount int `json:"resolved_count"`
+	TotalCount    int `json:"total_count"`
+}
+
+// ReconciliationReport is the published, immutable final report of one fully
+// reviewed reconciliation. The reconciliation and every resolution are deep
+// snapshots taken at publication, so later journals, statements,
+// reconciliations or resolutions can never change the document. A report can
+// never be updated or deleted once stored.
+type ReconciliationReport struct {
+	ID                 string             `json:"id"`
+	ReconciliationID   string             `json:"reconciliation_id"`
+	GeneratedAt        string             `json:"generated_at"`
+	ReviewStatus       string             `json:"review_status"`
+	Reconciliation     *Reconciliation    `json:"reconciliation"`
+	Resolutions        []*Resolution      `json:"resolutions"`
+	DispositionSummary DispositionSummary `json:"disposition_summary"`
+}
+
 // copyDifference deep-copies one frozen difference so a resolution snapshot
 // shares no memory with the reconciliation it was taken from.
 func copyDifference(difference *Difference) *Difference {
@@ -224,6 +248,25 @@ func copyDifference(difference *Difference) *Difference {
 		amount := *difference.LedgerAmountMinor
 		copied.LedgerAmountMinor = &amount
 	}
+	return &copied
+}
+
+// copyReconciliation deep-copies one frozen reconciliation, including every
+// difference, so a published report shares no memory with the stored original.
+func copyReconciliation(reconciliation *Reconciliation) *Reconciliation {
+	copied := *reconciliation
+	copied.Differences = make([]*Difference, 0, len(reconciliation.Differences))
+	for _, difference := range reconciliation.Differences {
+		copied.Differences = append(copied.Differences, copyDifference(difference))
+	}
+	return &copied
+}
+
+// copyResolution deep-copies one stored resolution, including its difference
+// snapshot, so a published report shares no memory with the stored original.
+func copyResolution(resolution *Resolution) *Resolution {
+	copied := *resolution
+	copied.Difference = copyDifference(resolution.Difference)
 	return &copied
 }
 

@@ -206,6 +206,13 @@ resolutions ordered by `difference_index` together with `difference_count`,
 `disposed_count`, `remaining_count` and a `review_status` that is `completed`
 once every frozen difference is disposed and `pending` otherwise.
 
+**Reconciliation reports.** `POST /reconciliation-reports` publishes the final
+report of one fully reviewed reconciliation as an independent resource. The
+report freezes a deep snapshot of the reconciliation and of every resolution,
+plus a `disposition_summary` counting `accepted` and `resolved` dispositions,
+and can never be updated or deleted: later activity and restarts never change
+what was published. Each reconciliation supports exactly one report.
+
 ## HTTP API
 
 Bodies are JSON. Every state-changing `POST` requires an `Idempotency-Key`
@@ -613,6 +620,70 @@ returns the review progress:
 `records` is sorted by `difference_index`; the counts always refer to the
 frozen differences. A balanced reconciliation returns empty `records`, zero
 counts and `review_status` `completed`.
+
+### Publish a reconciliation report
+
+```http
+POST /reconciliation-reports
+Idempotency-Key: report-1
+
+{"id":"rep-1","reconciliation_id":"rec-1"}
+```
+
+Publishes the final report of one fully reviewed reconciliation as an
+independent, immutable resource. The body carries only `id` and
+`reconciliation_id`; unknown fields, a malformed body or a missing
+`Idempotency-Key` return HTTP 400. Publication requires the reconciliation's
+`review_status` to be `completed` — every frozen difference disposed, which a
+balanced reconciliation satisfies trivially. Returns HTTP 201 with the stored
+report:
+
+```json
+{"id":"rep-1","reconciliation_id":"rec-1","generated_at":"2024-06-01T12:00:00Z",
+ "review_status":"completed",
+ "reconciliation":{"id":"rec-1","statement_id":"st-1","account_id":"1200",
+   "currency":"USD","functional_currency":"CNY",
+   "period":{"start":"2024-01-01","end":"2024-01-31"},
+   "status":"differences_found","matched_count":1,"statement_line_count":2,
+   "ledger_line_count":1,"statement_net_minor":87000,"ledger_net_minor":100000,
+   "difference_minor":-13000,
+   "summary":{"timing":0,"amount_mismatch":0,"missing_in_ledger":1,
+              "missing_in_statement":0},
+   "differences":[
+     {"type":"missing_in_ledger",
+      "detail":"the statement line has no journal line in the period",
+      "statement_line_id":"s2","statement_date":"2024-01-28",
+      "statement_amount_minor":-13000,"difference_minor":-13000}],
+   "created_at":"2024-06-01T12:00:00Z"},
+ "resolutions":[
+   {"id":"res-1","reconciliation_id":"rec-1","difference_index":1,
+    "disposition":"resolved","reason":"fee was refunded outside the ledger",
+    "difference":{"type":"missing_in_ledger",
+      "detail":"the statement line has no journal line in the period",
+      "statement_line_id":"s2","statement_date":"2024-01-28",
+      "statement_amount_minor":-13000,"difference_minor":-13000},
+    "created_at":"2024-06-01T12:00:00Z"}],
+ "disposition_summary":{"accepted_count":0,"resolved_count":1,"total_count":1}}
+```
+
+`reconciliation` is a deep snapshot of the frozen reconciliation and
+`resolutions` carries a deep snapshot of every resolution ordered by
+`difference_index`. `disposition_summary` always reports `accepted_count`,
+`resolved_count` and `total_count`, where `total_count` equals the number of
+resolutions and of frozen differences; a balanced reconciliation publishes
+with empty `resolutions` and all three counts zero. An unknown reconciliation
+returns HTTP 404; undisposed differences, a reused report `id` or a
+reconciliation that already has a report return HTTP 409. Replaying the same
+`Idempotency-Key` returns the first report without publishing again.
+
+```http
+GET /reconciliation-reports/rep-1
+```
+
+returns the same frozen document, accepts no query parameters and answers
+HTTP 404 with `not_found` for an unknown report. A report can never be updated
+or deleted, later journals, statements, reconciliations or resolutions never
+change it, and it survives restarts.
 
 ## Errors
 

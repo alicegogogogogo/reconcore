@@ -11,15 +11,16 @@ import (
 // be rewritten atomically as one JSON document after every mutation, which is
 // what replaces a real database driver in this standard-library-only build.
 type State struct {
-	Accounts        map[string]*Account           `json:"accounts"`
-	Journals        map[string]*Journal           `json:"journals"`
-	JournalBatches  map[string]*JournalBatch      `json:"journal_batches"`
-	Rates           []*Rate                       `json:"rates"`
-	Statements      map[string]*Statement         `json:"statements"`
-	Reconciliations map[string]*Reconciliation    `json:"reconciliations"`
-	Resolutions     map[string]*Resolution        `json:"resolutions"`
-	PeriodCloses    map[string]*PeriodClose       `json:"period_closes"`
-	Idempotency     map[string]*IdempotencyRecord `json:"idempotency"`
+	Accounts        map[string]*Account              `json:"accounts"`
+	Journals        map[string]*Journal              `json:"journals"`
+	JournalBatches  map[string]*JournalBatch         `json:"journal_batches"`
+	Rates           []*Rate                          `json:"rates"`
+	Statements      map[string]*Statement            `json:"statements"`
+	Reconciliations map[string]*Reconciliation       `json:"reconciliations"`
+	Resolutions     map[string]*Resolution           `json:"resolutions"`
+	Reports         map[string]*ReconciliationReport `json:"reconciliation_reports"`
+	PeriodCloses    map[string]*PeriodClose          `json:"period_closes"`
+	Idempotency     map[string]*IdempotencyRecord    `json:"idempotency"`
 }
 
 func newState() *State {
@@ -31,6 +32,7 @@ func newState() *State {
 		Statements:      map[string]*Statement{},
 		Reconciliations: map[string]*Reconciliation{},
 		Resolutions:     map[string]*Resolution{},
+		Reports:         map[string]*ReconciliationReport{},
 		PeriodCloses:    map[string]*PeriodClose{},
 		Idempotency:     map[string]*IdempotencyRecord{},
 	}
@@ -86,6 +88,9 @@ func (s *State) repair() {
 	}
 	if s.Resolutions == nil {
 		s.Resolutions = map[string]*Resolution{}
+	}
+	if s.Reports == nil {
+		s.Reports = map[string]*ReconciliationReport{}
 	}
 	if s.PeriodCloses == nil {
 		s.PeriodCloses = map[string]*PeriodClose{}

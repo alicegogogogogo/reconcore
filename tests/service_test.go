@@ -2198,3 +2198,213 @@ func TestJournalBatchSurvivesReopen(t *testing.T) {
 		t.Fatalf("batch changed after later activity: %v", after)
 	}
 }
+
+func reportBody(id, reconciliationID string) string {
+	return fmt.Sprintf(`{"id":%q,"reconciliation_id":%q}`, id, reconciliationID)
+}
+
+func TestReconciliationReportLifecycle(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+
+	// A reconciliation with undisposed differences cannot be published yet.
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "early",
+		body: reportBody("rep-early", "rec-1")}, 409, "conflict", "undisposed")
+
+	// Dispose the second difference first; the report must still sort by index.
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-2", 2, "resolved", "corrected outside the system"))
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "timing difference is expected"))
+
+	created := client.created("/reconciliation-reports", reportBody("rep-1", "rec-1"))
+	if text(t, created, "id") != "rep-1" || text(t, created, "reconciliation_id") != "rec-1" {
+		t.Fatalf("report is %v", created)
+	}
+	if text(t, created, "generated_at") != "2024-06-01T12:00:00Z" {
+		t.Fatalf("generated_at is %v", created["generated_at"])
+	}
+	if text(t, created, "review_status") != "completed" {
+		t.Fatalf("review_status is %v", created["review_status"])
+	}
+	snapshot, ok := created["reconciliation"].(map[string]any)
+	if !ok || text(t, snapshot, "id") != "rec-1" || text(t, snapshot, "status") != "differences_found" {
+		t.Fatalf("reconciliation snapshot is %v", created["reconciliation"])
+	}
+	if len(objects(t, snapshot, "differences")) != 2 || integer(t, snapshot, "difference_minor") != 19000 {
+		t.Fatalf("reconciliation snapshot is %v", snapshot)
+	}
+	resolutions := objects(t, created, "resolutions")
+	if len(resolutions) != 2 || text(t, resolutions[0], "id") != "res-1" || text(t, resolutions[1], "id") != "res-2" {
+		t.Fatalf("resolutions are not sorted by difference_index: %v", resolutions)
+	}
+	if integer(t, resolutions[0], "difference_index") != 1 || integer(t, resolutions[1], "difference_index") != 2 {
+		t.Fatalf("resolution indexes are %v", resolutions)
+	}
+	firstDifference, ok := resolutions[0]["difference"].(map[string]any)
+	if !ok || text(t, firstDifference, "type") != "missing_in_ledger" {
+		t.Fatalf("resolution snapshot is %v", resolutions[0])
+	}
+	summary, ok := created["disposition_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("disposition_summary is %v", created["disposition_summary"])
+	}
+	if integer(t, summary, "accepted_count") != 1 || integer(t, summary, "resolved_count") != 1 ||
+		integer(t, summary, "total_count") != 2 {
+		t.Fatalf("disposition_summary is %v", summary)
+	}
+
+	// GET returns exactly the document that was created.
+	if fetched := client.ok("/reconciliation-reports/rep-1"); !reflect.DeepEqual(fetched, created) {
+		t.Fatalf("fetched report %v differs from the created one %v", fetched, created)
+	}
+}
+
+func TestReconciliationReportConflicts(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "expected"))
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-2", 2, "resolved", "refunded"))
+	client.created("/reconciliation-reports", reportBody("rep-1", "rec-1"))
+
+	// The report id is taken and the reconciliation already has a report.
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "dup-id",
+		body: reportBody("rep-1", "rec-1")}, 409, "conflict", "already exists")
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "dup-recon",
+		body: reportBody("rep-2", "rec-1")}, 409, "conflict", "already has report")
+
+	// An unknown reconciliation is a not_found, not a conflict.
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "missing",
+		body: reportBody("rep-3", "rec-unknown")}, 404, "not_found", "rec-unknown")
+}
+
+func TestReconciliationReportValidation(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "v1",
+		body: `["not-an-object"]`}, 400, "validation_error", "JSON object")
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "v2",
+		body: `{"id":"rep-1","reconciliation_id":"rec-1","note":"x"}`}, 400, "validation_error", "unknown")
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "v3",
+		body: `{"id":"","reconciliation_id":"rec-1"}`}, 400, "validation_error", "report id")
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "v4",
+		body: `{"id":"rep-1","reconciliation_id":"has space"}`}, 400, "validation_error", "reconciliation_id")
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports",
+		body: reportBody("rep-1", "rec-1")}, 400, "validation_error", "Idempotency-Key")
+
+	// The read side accepts no query parameters and reports unknown ids.
+	client.expect(request{method: http.MethodGet, path: "/reconciliation-reports/rep-1?verbose=true"},
+		400, "validation_error", "unknown query parameter")
+	client.expect(request{method: http.MethodGet, path: "/reconciliation-reports/rep-missing"},
+		404, "not_found", "rep-missing")
+}
+
+func TestReconciliationReportIdempotency(t *testing.T) {
+	client := newClient(t)
+	setupResolvableReconciliation(t, client)
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "expected"))
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-2", 2, "resolved", "refunded"))
+
+	body := reportBody("rep-1", "rec-1")
+	firstStatus, firstRaw, _ := client.send(request{
+		method: http.MethodPost, path: "/reconciliation-reports", key: "rep-replay", body: body})
+	secondStatus, secondRaw, _ := client.send(request{
+		method: http.MethodPost, path: "/reconciliation-reports", key: "rep-replay", body: body})
+	if firstStatus != http.StatusCreated || secondStatus != http.StatusCreated {
+		t.Fatalf("idempotent statuses are %d and %d", firstStatus, secondStatus)
+	}
+	if firstRaw != secondRaw {
+		t.Fatalf("replayed report differs:\n%s\n%s", firstRaw, secondRaw)
+	}
+
+	// The replayed key did not publish a second report for the reconciliation.
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "fresh",
+		body: reportBody("rep-2", "rec-1")}, 409, "conflict", "already has report")
+
+	// The same key used for another operation is a conflict.
+	client.expect(request{method: http.MethodPost, path: "/reconciliation-reports", key: "rep-replay",
+		body: reportBody("rep-9", "rec-1")}, 409, "conflict", "another operation")
+	client.expect(request{method: http.MethodPost, path: "/accounts", key: "rep-replay",
+		body: accountBody("9000", "Other", "asset", "CNY")}, 409, "conflict", "another operation")
+}
+
+func TestReconciliationReportOnBalancedReconciliation(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1100", "Bank", "asset", "CNY"))
+	client.created("/statements", `{
+		"id":"st-balanced","account_id":"1100","currency":"CNY",
+		"period":{"start":"2024-03-01","end":"2024-03-31"},
+		"opening_balance_minor":5000,"closing_balance_minor":5000,
+		"lines":[]}`)
+	reconciliation := client.created("/reconciliations", `{"id":"rec-balanced","statement_id":"st-balanced"}`)
+	if text(t, reconciliation, "status") != "balanced" {
+		t.Fatalf("reconciliation is %v", reconciliation)
+	}
+
+	created := client.created("/reconciliation-reports", reportBody("rep-balanced", "rec-balanced"))
+	if text(t, created, "review_status") != "completed" {
+		t.Fatalf("report is %v", created)
+	}
+	if resolutions := objects(t, created, "resolutions"); len(resolutions) != 0 {
+		t.Fatalf("resolutions are %v", resolutions)
+	}
+	summary, ok := created["disposition_summary"].(map[string]any)
+	if !ok || integer(t, summary, "accepted_count") != 0 || integer(t, summary, "resolved_count") != 0 ||
+		integer(t, summary, "total_count") != 0 {
+		t.Fatalf("disposition_summary is %v", created["disposition_summary"])
+	}
+	snapshot, ok := created["reconciliation"].(map[string]any)
+	if !ok || text(t, snapshot, "status") != "balanced" || len(objects(t, snapshot, "differences")) != 0 {
+		t.Fatalf("reconciliation snapshot is %v", created["reconciliation"])
+	}
+	if fetched := client.ok("/reconciliation-reports/rep-balanced"); !reflect.DeepEqual(fetched, created) {
+		t.Fatalf("fetched report %v differs from the created one %v", fetched, created)
+	}
+}
+
+func TestReconciliationReportSurvivesReopenAndLaterActivity(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	setupResolvableReconciliation(t, client)
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-1", 1, "accepted", "expected"))
+	client.created("/reconciliations/rec-1/resolutions",
+		resolutionBody("res-2", 2, "resolved", "refunded"))
+	created := client.created("/reconciliation-reports", reportBody("rep-1", "rec-1"))
+
+	// The report survives a restart byte for byte.
+	reopened := newClientOn(t, database)
+	if again := reopened.ok("/reconciliation-reports/rep-1"); !reflect.DeepEqual(again, created) {
+		t.Fatalf("report after reopen %v differs from the created one %v", again, created)
+	}
+
+	// Later journals, statements, reconciliations and resolutions never change
+	// the frozen report. Fresh explicit keys are used because the automatic
+	// ones were spent on this database before the restart.
+	for _, step := range []request{
+		{method: http.MethodPost, path: "/journals", key: "late-journal", body: `{
+			"id":"jv-late","date":"2024-03-20",
+			"lines":[
+				{"account_id":"1100","side":"debit","amount_minor":4200},
+				{"account_id":"4000","side":"credit","amount_minor":4200}
+			]}`},
+		{method: http.MethodPost, path: "/statements", key: "late-statement", body: `{
+			"id":"st-late","account_id":"1100","currency":"CNY",
+			"period":{"start":"2024-04-01","end":"2024-04-30"},
+			"opening_balance_minor":0,"closing_balance_minor":0,"lines":[]}`},
+		{method: http.MethodPost, path: "/reconciliations", key: "late-reconciliation",
+			body: `{"id":"rec-late","statement_id":"st-late"}`},
+	} {
+		if status, raw, _ := reopened.send(step); status != http.StatusCreated {
+			t.Fatalf("%s %s returned %d: %s", step.method, step.path, status, raw)
+		}
+	}
+	if after := reopened.ok("/reconciliation-reports/rep-1"); !reflect.DeepEqual(after, created) {
+		t.Fatalf("report changed after later activity: %v", after)
+	}
+}
