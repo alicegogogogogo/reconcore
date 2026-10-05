@@ -1948,3 +1948,253 @@ func TestResolutionsSurviveReopenAndLaterActivity(t *testing.T) {
 	reopened.expect(request{method: http.MethodPost, path: "/reconciliations/rec-1/resolutions", key: "late-2",
 		body: resolutionBody("res-2", 1, "resolved", "second opinion")}, 409, "conflict", "already has resolution")
 }
+
+func batchJournalBody(id, date string, amount int) string {
+	return fmt.Sprintf(`{
+		"id":%q,"date":%q,
+		"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":%d},
+			{"account_id":"4000","side":"credit","amount_minor":%d}
+		]}`, id, date, amount, amount)
+}
+
+func batchBody(id string, journals ...string) string {
+	return `{"id":` + fmt.Sprintf("%q", id) + `,"journals":[` + strings.Join(journals, ",") + `]}`
+}
+
+func TestJournalBatchLifecycle(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+
+	// A journal posted one by one, to compare against a batched twin.
+	single := client.created("/journals", batchJournalBody("jv-single", "2024-01-15", 100000))
+
+	body := batchBody("batch-1",
+		batchJournalBody("jv-b1", "2024-01-15", 100000),
+		batchJournalBody("jv-b2", "2024-01-16", 4200),
+	)
+	status, raw, batch := client.send(request{method: http.MethodPost, path: "/journal-batches", key: "batch-key-1", body: body})
+	if status != http.StatusCreated {
+		t.Fatalf("POST /journal-batches returned %d: %s", status, raw)
+	}
+	if text(t, batch, "id") != "batch-1" || integer(t, batch, "journal_count") != 2 {
+		t.Fatalf("batch document is %v", batch)
+	}
+	if text(t, batch, "created_at") == "" {
+		t.Fatalf("batch has no created_at: %v", batch)
+	}
+	ids, ok := batch["journal_ids"].([]any)
+	if !ok || len(ids) != 2 || ids[0] != "jv-b1" || ids[1] != "jv-b2" {
+		t.Fatalf("journal_ids are %v, want [jv-b1 jv-b2] in request order", batch["journal_ids"])
+	}
+
+	// Every voucher reads back through GET /journals/{id}; the twin matches
+	// the individually posted journal except for its id.
+	twin := client.ok("/journals/jv-b1")
+	delete(twin, "id")
+	delete(single, "id")
+	if !reflect.DeepEqual(twin, single) {
+		t.Fatalf("batched journal %v differs from the individual one %v", twin, single)
+	}
+	if second := client.ok("/journals/jv-b2"); integer(t, second, "debit_functional_minor") != 4200 {
+		t.Fatalf("second batched journal is %v", second)
+	}
+
+	// Batched journals feed the derived views like any other voucher.
+	balance := client.ok("/accounts/1000/balance?as_of=2024-01-31")
+	if integer(t, balance, "debit_minor") != 204200 || integer(t, balance, "posting_count") != 3 {
+		t.Fatalf("balance including batched journals is %v", balance)
+	}
+
+	// GET returns the create document and accepts no query parameter.
+	if again := client.ok("/journal-batches/batch-1"); !reflect.DeepEqual(again, batch) {
+		t.Fatalf("GET batch %v differs from the create response %v", again, batch)
+	}
+	client.expect(request{method: http.MethodGet, path: "/journal-batches/batch-1?verbose=true"},
+		400, "validation_error", "unknown query parameter")
+	client.expect(request{method: http.MethodGet, path: "/journal-batches/nope"}, 404, "not_found", "")
+
+	// Replaying the same key returns the first response and writes nothing,
+	// even when the replayed body carries a different payload for the same
+	// batch id.
+	replayStatus, replayRaw, _ := client.send(request{method: http.MethodPost, path: "/journal-batches", key: "batch-key-1",
+		body: batchBody("batch-1",
+			batchJournalBody("jv-b1", "2024-01-15", 100000),
+			batchJournalBody("jv-b2", "2024-01-16", 4200),
+			batchJournalBody("jv-x", "2024-01-17", 5))})
+	if replayStatus != http.StatusCreated || replayRaw != raw {
+		t.Fatalf("replay returned %d %s, want the first response %s", replayStatus, replayRaw, raw)
+	}
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-x"}, 404, "not_found", "")
+
+	// The same key on another operation conflicts.
+	client.expect(request{method: http.MethodPost, path: "/journals", key: "batch-key-1",
+		body: batchJournalBody("jv-y", "2024-01-18", 5)}, 409, "conflict", "already used for another operation")
+
+	// The batch id stays taken.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "batch-again",
+		body: batchBody("batch-1", batchJournalBody("jv-z", "2024-01-19", 5))},
+		409, "conflict", "already exists")
+}
+
+func TestJournalBatchValidation(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	one := batchJournalBody("jv-1", "2024-01-15", 5)
+
+	// Body shape, batch id and journals array rules.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v1", body: `[1,2]`},
+		400, "validation_error", "must be a JSON object")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v2",
+		body: `{"journals":[` + one + `]}`},
+		400, "validation_error", "batch id is required")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v3",
+		body: batchBody("bad id", one)},
+		400, "validation_error", "printable ASCII")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v4", body: `{"id":"b-1"}`},
+		400, "validation_error", "between 1 and 100")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v5",
+		body: `{"id":"b-1","journals":"many"}`},
+		400, "validation_error", "")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v6",
+		body: `{"id":"b-1","journals":[]}`},
+		400, "validation_error", "between 1 and 100")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v7",
+		body: `{"id":"b-1","journals":[null]}`},
+		400, "validation_error", "must be an object")
+
+	// One hundred and one journals overflow the batch.
+	entries := make([]string, 0, 101)
+	for index := 0; index < 101; index++ {
+		entries = append(entries, batchJournalBody(fmt.Sprintf("jv-%03d", index), "2024-01-15", 5))
+	}
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v8",
+		body: batchBody("b-big", entries...)},
+		400, "validation_error", "between 1 and 100")
+
+	// Unknown fields on the batch object and on a journal object.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v9",
+		body: `{"id":"b-1","note":"x","journals":[` + one + `]}`},
+		400, "validation_error", "unknown field")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v10",
+		body: `{"id":"b-1","journals":[{"id":"jv-1","date":"2024-01-15","approved":true,"lines":[
+			{"account_id":"1000","side":"debit","amount_minor":5},
+			{"account_id":"4000","side":"credit","amount_minor":5}]}]}`},
+		400, "validation_error", "unknown field")
+
+	// Journal content errors stay validation errors.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v11",
+		body: `{"id":"b-1","journals":[{"id":"jv-1","date":"2024-01-15","lines":[
+			{"account_id":"1000","side":"debit","amount_minor":5},
+			{"account_id":"4000","side":"credit","amount_minor":6}]}]}`},
+		400, "validation_error", "not balanced")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v12",
+		body: `{"id":"b-1","journals":[{"id":"jv-1","date":"2024-01-15","lines":[
+			{"account_id":"9999","side":"debit","amount_minor":5},
+			{"account_id":"4000","side":"credit","amount_minor":5}]}]}`},
+		400, "validation_error", "does not exist")
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "v13",
+		body: `{"id":"b-1","journals":[{"id":"jv-1","date":"2024-13-01","lines":[
+			{"account_id":"1000","side":"debit","amount_minor":5},
+			{"account_id":"4000","side":"credit","amount_minor":5}]}]}`},
+		400, "validation_error", "ISO 8601")
+
+	// The idempotency key is still required.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches",
+		body: batchBody("b-1", one)},
+		400, "validation_error", "Idempotency-Key")
+}
+
+func TestJournalBatchAtomicityAndConflicts(t *testing.T) {
+	client := newClient(t)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	client.created("/journals", batchJournalBody("jv-existing", "2024-01-10", 100))
+	client.created("/period-closes", `{"id":"pc-2024-02","period":{"start":"2024-02-01","end":"2024-02-29"}}`)
+
+	// A batch whose second voucher is invalid writes nothing at all.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "a1",
+		body: batchBody("b-bad",
+			batchJournalBody("jv-ok", "2024-01-15", 5),
+			`{"id":"jv-bad","date":"2024-01-16","lines":[
+				{"account_id":"1000","side":"debit","amount_minor":5},
+				{"account_id":"4000","side":"credit","amount_minor":6}]}`)},
+		400, "validation_error", "not balanced")
+	client.expect(request{method: http.MethodGet, path: "/journal-batches/b-bad"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-ok"}, 404, "not_found", "")
+
+	// A journal id that already exists conflicts and writes nothing.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "a2",
+		body: batchBody("b-dup",
+			batchJournalBody("jv-new", "2024-01-15", 5),
+			batchJournalBody("jv-existing", "2024-01-16", 5))},
+		409, "conflict", "already exists")
+	client.expect(request{method: http.MethodGet, path: "/journal-batches/b-dup"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-new"}, 404, "not_found", "")
+
+	// A duplicate id inside the batch conflicts.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "a3",
+		body: batchBody("b-inner",
+			batchJournalBody("jv-twice", "2024-01-15", 5),
+			batchJournalBody("jv-twice", "2024-01-16", 5))},
+		409, "conflict", "duplicated")
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-twice"}, 404, "not_found", "")
+
+	// A voucher dated in a closed month conflicts and writes nothing.
+	client.expect(request{method: http.MethodPost, path: "/journal-batches", key: "a4",
+		body: batchBody("b-closed", batchJournalBody("jv-feb", "2024-02-10", 5))},
+		409, "conflict", "closed period rejects journal")
+	client.expect(request{method: http.MethodGet, path: "/journal-batches/b-closed"}, 404, "not_found", "")
+	client.expect(request{method: http.MethodGet, path: "/journals/jv-feb"}, 404, "not_found", "")
+
+	// A failed request stores no idempotency record: the same key is free once
+	// the body is fixed.
+	status, raw, _ := client.send(request{method: http.MethodPost, path: "/journal-batches", key: "a4",
+		body: batchBody("b-closed", batchJournalBody("jv-feb", "2024-03-10", 5))})
+	if status != http.StatusCreated {
+		t.Fatalf("reused key after a failure returned %d: %s", status, raw)
+	}
+}
+
+func TestJournalBatchSurvivesReopen(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "ledger.db")
+	client := newClientOn(t, database)
+	client.created("/accounts", accountBody("1000", "Cash", "asset", "CNY"))
+	client.created("/accounts", accountBody("4000", "Revenue", "revenue", "CNY"))
+	created := client.created("/journal-batches", batchBody("batch-1",
+		batchJournalBody("jv-b1", "2024-01-15", 700),
+		batchJournalBody("jv-b2", "2024-01-16", 900),
+	))
+
+	reopened := newClientOn(t, database)
+	if again := reopened.ok("/journal-batches/batch-1"); !reflect.DeepEqual(again, created) {
+		t.Fatalf("batch after reopen %v differs from the created one %v", again, created)
+	}
+	if journal := reopened.ok("/journals/jv-b1"); integer(t, journal, "debit_functional_minor") != 700 {
+		t.Fatalf("batched journal after reopen is %v", journal)
+	}
+
+	// The batch id stays taken after a restart.
+	reopened.expect(request{method: http.MethodPost, path: "/journal-batches", key: "late",
+		body: batchBody("batch-1", batchJournalBody("jv-b3", "2024-01-17", 5))},
+		409, "conflict", "already exists")
+
+	// Later activity never rewrites the committed batch record. The reopened
+	// client uses fresh explicit keys because its automatic ones were already
+	// spent on this database before the restart.
+	for _, step := range []request{
+		{method: http.MethodPost, path: "/journals", key: "late-journal",
+			body: batchJournalBody("jv-later", "2024-01-20", 5)},
+		{method: http.MethodPost, path: "/period-closes", key: "late-close",
+			body: `{"id":"pc-2024-01","period":{"start":"2024-01-01","end":"2024-01-31"}}`},
+	} {
+		if status, raw, _ := reopened.send(step); status != http.StatusCreated {
+			t.Fatalf("%s %s returned %d: %s", step.method, step.path, status, raw)
+		}
+	}
+	if after := reopened.ok("/journal-batches/batch-1"); !reflect.DeepEqual(after, created) {
+		t.Fatalf("batch changed after later activity: %v", after)
+	}
+}

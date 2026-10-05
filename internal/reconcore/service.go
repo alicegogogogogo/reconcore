@@ -635,6 +635,99 @@ func (s *Service) GetJournal(id string) (any, error) {
 	})
 }
 
+// maxBatchJournals bounds how many vouchers one atomic batch may carry.
+const maxBatchJournals = 100
+
+type createJournalBatchRequest struct {
+	ID       string                  `json:"id"`
+	Journals []*createJournalRequest `json:"journals"`
+}
+
+// CreateJournalBatch imports 1 to 100 ordinary journals as one atomic unit.
+// Every voucher is validated and constructed in request order under exactly
+// the rules of POST /journals; any failure rejects the whole batch and writes
+// nothing, and only a fully valid batch commits its journals, its batch record
+// and its idempotency record in a single state write.
+func (s *Service) CreateJournalBatch(body []byte, key string) (any, error) {
+	var request createJournalBatchRequest
+	if err := decodeObject(body, &request); err != nil {
+		return nil, err
+	}
+	id, err := validateIdentifier(request.ID, "batch id")
+	if err != nil {
+		return nil, err
+	}
+	if len(request.Journals) < 1 || len(request.Journals) > maxBatchJournals {
+		return nil, ValidationError("journals must contain between 1 and %d vouchers", maxBatchJournals)
+	}
+	type journalHead struct {
+		id   string
+		date string
+		memo string
+	}
+	heads := make([]journalHead, len(request.Journals))
+	for position, raw := range request.Journals {
+		if raw == nil {
+			return nil, ValidationError("journals[%d] must be an object", position+1)
+		}
+		journalID, date, memo, err := validateJournalHead(raw.ID, raw.Date, raw.Memo, len(raw.Lines))
+		if err != nil {
+			return nil, err
+		}
+		heads[position] = journalHead{id: journalID, date: date, memo: memo}
+	}
+	return s.runIdempotent(key, "create-journal-batch:"+id, func(state *State) (any, error) {
+		if _, found := state.JournalBatches[id]; found {
+			return nil, ConflictError("journal batch %s already exists", id)
+		}
+		seen := make(map[string]bool, len(request.Journals))
+		journals := make([]*Journal, 0, len(request.Journals))
+		journalIDs := make([]string, 0, len(request.Journals))
+		for position, raw := range request.Journals {
+			head := heads[position]
+			if seen[head.id] {
+				return nil, ConflictError("journal id %s is duplicated inside the batch", head.id)
+			}
+			seen[head.id] = true
+			if _, found := state.Journals[head.id]; found {
+				return nil, ConflictError("journal %s already exists", head.id)
+			}
+			if closedPeriodFor(state, head.date) != nil {
+				return nil, ConflictError("closed period rejects journal")
+			}
+			journal, err := s.buildJournal(state, raw, head.id, head.date, head.memo)
+			if err != nil {
+				return nil, err
+			}
+			journals = append(journals, journal)
+			journalIDs = append(journalIDs, head.id)
+		}
+		for _, journal := range journals {
+			state.Journals[journal.ID] = journal
+		}
+		batch := &JournalBatch{
+			ID:           id,
+			JournalCount: len(journalIDs),
+			JournalIDs:   journalIDs,
+			CreatedAt:    s.now(),
+		}
+		state.JournalBatches[id] = batch
+		return batch, nil
+	})
+}
+
+// GetJournalBatch returns one committed batch record with its journal ids in
+// the original request order.
+func (s *Service) GetJournalBatch(id string) (any, error) {
+	return s.store.View(func(state *State) (any, error) {
+		batch, found := state.JournalBatches[id]
+		if !found {
+			return nil, NotFoundError("journal batch %s was not found", id)
+		}
+		return batch, nil
+	})
+}
+
 type createReversalRequest struct {
 	ID   string `json:"id"`
 	Date string `json:"date"`

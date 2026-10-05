@@ -104,6 +104,16 @@ type Journal struct {
 	ReversalOf            string         `json:"reversal_of,omitempty"`
 }
 
+// JournalBatch is the durable record of one atomic batch import. JournalIDs
+// keeps the vouchers in the exact request order; the record is written once,
+// together with every journal of the batch, and is never rewritten afterwards.
+type JournalBatch struct {
+	ID           string   `json:"id"`
+	JournalCount int      `json:"journal_count"`
+	JournalIDs   []string `json:"journal_ids"`
+	CreatedAt    string   `json:"created_at"`
+}
+
 // Period is an inclusive date window.
 type Period struct {
 	Start string `json:"start"`

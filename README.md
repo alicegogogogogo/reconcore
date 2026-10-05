@@ -86,6 +86,18 @@ is rejected unless `Σ debit functional = Σ credit functional`; both totals are
 returned as `debit_functional_minor` and `credit_functional_minor`. Journals are
 immutable and posting never rewrites history.
 
+**Journal batches.** `POST /journal-batches` imports 1 to 100 ordinary journals
+as one atomic unit. The body is `{"id": ..., "journals": [...]}` where `id`
+follows the journal id rules and every element of `journals` is exactly a
+`POST /journals` body, validated and constructed in request order under the
+same rules. Any failure — an invalid voucher, a duplicate or existing journal
+id, a duplicate batch id or a date inside a closed month — rejects the whole
+batch and writes nothing; only a fully valid batch commits every journal, the
+batch record and the idempotency record in one write. The stored batch
+document is `{"id", "journal_count", "journal_ids", "created_at"}` with
+`journal_ids` in request order, is returned by `GET /journal-batches/{id}` and
+is never rewritten by later activity.
+
 **Reversals.** `POST /journals/{id}/reversals` cancels a posted journal by
 appending exactly one new journal whose `reversal_of` names the original. The
 body carries only `id`, `date` and `memo`, all required: `id` follows the
@@ -424,6 +436,52 @@ journal's date returns HTTP 400. An unknown original returns HTTP 404. A
 reversal `id` that already exists, an original that is itself a reversal, an
 original that was already reversed, or a `date` inside a closed month returns
 HTTP 409 and writes nothing.
+
+### Import a journal batch
+
+```http
+POST /journal-batches
+Idempotency-Key: batch-1
+
+{"id":"batch-1","journals":[
+  {"id":"jv-1","date":"2024-01-15","memo":"consulting invoice",
+   "lines":[
+     {"account_id":"1200","side":"debit","amount_minor":100000,"reference":"INV-1"},
+     {"account_id":"4200","side":"credit","amount_minor":100000,"reference":"INV-1"}
+   ]},
+  {"id":"jv-2","date":"2024-01-16",
+   "lines":[
+     {"account_id":"1200","side":"debit","amount_minor":4200},
+     {"account_id":"4200","side":"credit","amount_minor":4200}
+   ]}
+]}
+```
+
+`journals` carries 1 to 100 ordinary journal bodies, each validated and
+constructed in request order under exactly the rules of `POST /journals`; the
+batch `id` follows the journal id rules and unknown fields are rejected on the
+batch and on every journal object. Returns HTTP 201 with the batch document:
+
+```json
+{"id":"batch-1","journal_count":2,"journal_ids":["jv-1","jv-2"],
+ "created_at":"2024-06-01T12:00:00Z"}
+```
+
+Every journal is then readable through `GET /journals/{id}` exactly as if it
+had been posted one by one. An invalid voucher returns HTTP 400; a journal id
+that already exists, a journal id duplicated inside the batch, a batch id that
+already exists or a voucher dated in a closed month returns HTTP 409. Any
+failure writes nothing — no batch record, no journal and no idempotency
+record — and a fully valid batch commits everything in one write. Replaying
+the same `Idempotency-Key` returns the first response without writing again.
+
+```http
+GET /journal-batches/batch-1
+```
+
+returns the same document, accepts no query parameters and answers HTTP 404
+with `not_found` for an unknown batch. The record and the journal order
+survive restarts and are never rewritten by later activity.
 
 ### Close a period
 
